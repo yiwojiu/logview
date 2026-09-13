@@ -1,0 +1,29 @@
+[package]
+name = "logview"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform viewer for huge log files, built with egui"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/iot_xush/logview"
+keywords = ["log", "viewer", "gui", "egui", "tail"]
+categories = ["gui", "visualization"]
+
+[[bin]]
+name = "logview"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+memmap2 = "0.9"
+memchr = "2"
+encoding_rs = "0.8"
+rfd = "0.15"
+anyhow = "1"
+
+[dev-dependencies]
+encoding_rs = "0.8"
+
+[profile.release]
+opt-level = 2
