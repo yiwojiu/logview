@@ -1,6 +1,6 @@
 [package]
 name = "logview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Cross-platform viewer for huge log files, built with egui"
 license = "MIT OR Apache-2.0"
