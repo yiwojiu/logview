@@ -79,17 +79,29 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 产物在 `target/<target>/release/logview`（Windows 是 `logview.exe`）。
 
-### 打包分发
+### 发布版本
 
-需要 dmg / msi / AppImage 安装包，用 `cargo-dist`：
+推一个 `v` 开头的 tag 即可，`.github/workflows/release.yml` 会自动构建四个平台的产物、
+生成 SHA256 校验和，并创建 GitHub Release（含自动生成的更新说明）：
 
 ```bash
-cargo install cargo-dist
-cargo dist init        # 按提示填，会生成 GitHub Actions 工作流
-cargo dist build
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-推 tag 后自动为三个平台构建并发布到 GitHub Release。
+产物：
+
+| 文件 | 平台 |
+|---|---|
+| `logview-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `logview-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+| `logview-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+| `logview-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+注：macOS 产物未做代码签名，用户首次打开需要右键→打开，或 `xattr -d com.apple.quarantine logview`。
+Linux 产物链接的是 Ubuntu 24.04 的 glibc，太老的发行版可能跑不起来。
+
+需要 dmg / msi / AppImage 这类安装包，可以再引入 `cargo-dist`（`cargo dist init` 会生成配套工作流）。
 
 ## 已知限制
 
@@ -106,7 +118,8 @@ cargo clippy --all-targets    # 静态检查，CI 里 -D warnings
 cargo test                    # 测试
 ```
 
-CI 在 ubuntu / macos / windows 三个平台跑上面三项，配置见 `.github/workflows/ci.yml`。
+CI 在 ubuntu / macos / windows 三个平台跑上面三项，配置见 `.github/workflows/ci.yml`；
+打 tag 出包见 `.github/workflows/release.yml`。
 
 ## 许可证
 

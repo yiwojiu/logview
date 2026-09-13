@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
@@ -41,8 +40,10 @@ jobs:
       - name: 格式检查
         run: cargo fmt --all -- --check
 
+      # 只把自己的代码警告当错误，不用全局 RUSTFLAGS，
+      # 否则第三方依赖带警告也会让构建失败
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: 测试
         run: cargo test --all-targets
