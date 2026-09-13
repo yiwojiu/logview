@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" width="112" alt="logview 图标">
+</p>
+
 # logview
 
 [![CI](https://github.com/yiwojiu/logview/actions/workflows/ci.yml/badge.svg)](https://github.com/yiwojiu/logview/actions/workflows/ci.yml)
