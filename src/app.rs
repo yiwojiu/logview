@@ -10,6 +10,16 @@ const MAX_RENDER_CHARS: usize = 4000;
 /// 搜索框的固定 Id，用于快捷键聚焦与失焦
 const SEARCH_ID: &str = "logview_search";
 
+/// 界面提示里修饰键的写法。
+///
+/// egui 的 `Modifiers::COMMAND` 是逻辑修饰键：macOS 上是 ⌘，其他平台是 Ctrl，
+/// 界面文案得跟着平台走，否则 Windows 用户看到 ⌘ 会不知道按什么。
+const CMD: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "Ctrl+"
+};
+
 pub struct LogViewApp {
     store: Option<LogStore>,
     query: String,
@@ -277,7 +287,7 @@ impl LogViewApp {
             let resp = ui.add(
                 TextEdit::singleline(&mut self.query)
                     .id(egui::Id::new(SEARCH_ID))
-                    .hint_text("搜索（⌘F 或 / 聚焦，n / N 跳转）")
+                    .hint_text(format!("搜索（{CMD}F 或 / 聚焦，n / N 跳转）"))
                     .desired_width(320.0),
             );
             if self.focus_search {
@@ -323,14 +333,14 @@ impl LogViewApp {
                 }
             }
 
-            let _ = ui.button("?").on_hover_text(
+            let _ = ui.button("?").on_hover_text(format!(
                 "快捷键\n\
-                 ⌘F 或 /    聚焦搜索框\n\
-                 n / N      下 / 上一个命中\n\
-                 g / G      跳到开头 / 末尾\n\
-                 Esc        清空检索\n\
-                 ⌘O         打开文件",
-            );
+                 {CMD}F 或 / — 聚焦搜索框\n\
+                 n / N — 下 / 上一个命中\n\
+                 g / G — 跳到开头 / 末尾\n\
+                 Esc — 清空检索\n\
+                 {CMD}O — 打开文件"
+            ));
         });
         ui.add_space(4.0);
         let _ = ctx;
