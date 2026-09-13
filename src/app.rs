@@ -106,6 +106,17 @@ impl LogViewApp {
         self.match_cursor = 0;
     }
 
+    /// 用给定的词直接发起检索（双击行内文字时调用）。
+    ///
+    /// 不抢搜索框焦点：连着双击几个词追查线索时，焦点留在日志区更顺手。
+    fn search_for(&mut self, word: String) {
+        if word.is_empty() {
+            return;
+        }
+        self.query = word;
+        self.run_search();
+    }
+
     fn handle_drop(&mut self, ctx: &egui::Context) {
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         if let Some(f) = dropped.into_iter().next() {
@@ -339,7 +350,8 @@ impl LogViewApp {
                  n / N — 下 / 上一个命中\n\
                  g / G — 跳到开头 / 末尾\n\
                  Esc — 清空检索\n\
-                 {CMD}O — 打开文件"
+                 {CMD}O — 打开文件\n\
+                 双击行内文字 — 用该词搜索"
             ));
         });
         ui.add_space(4.0);
@@ -451,6 +463,8 @@ impl LogViewApp {
         let only = self.only_matched;
         let wrap = self.wrap;
         let store_ref = &self.store;
+        // 双击行内文字要发起的检索；闭包内拿不到 &mut self，先收集、结束后再处理
+        let mut search_word: Option<String> = None;
 
         let out = area.show_rows(ui, row_h, total, |ui, rows| {
             let Some(store) = store_ref else { return };
@@ -475,11 +489,17 @@ impl LogViewApp {
                                     .color(ui.visuals().weak_text_color()),
                             ),
                         );
-                        render_content(ui, buf, &query, cs, wrap);
+                        if let Some(word) = render_content(ui, buf, &query, cs, wrap) {
+                            search_word = Some(word);
+                        }
                     });
                 });
             }
         });
+
+        if let Some(word) = search_word {
+            self.search_for(word);
+        }
 
         if !stick {
             self.scroll_offset = out.state.offset.y;
@@ -487,7 +507,19 @@ impl LogViewApp {
     }
 }
 
-fn render_content(ui: &mut egui::Ui, text: &str, query: &str, case_sensitive: bool, wrap: bool) {
+/// 绘制一行内容，返回该行被双击时命中的词。
+///
+/// 这里没有用 `Label::selectable`，而是自己 layout galley 再交给
+/// `LabelSelectionState::label_text_selection`。两者都提供划选与复制，
+/// 区别在于后者会把 galley 留在手上，才能反查"双击点到了哪个词"——
+/// egui 并未对外暴露 Label 当前选中的文本，这是唯一可行的路子。
+fn render_content(
+    ui: &mut egui::Ui,
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    wrap: bool,
+) -> Option<String> {
     let mut shown = text;
     if shown.len() > MAX_RENDER_CHARS {
         shown = floor_char_boundary(shown, MAX_RENDER_CHARS);
@@ -511,17 +543,82 @@ fn render_content(ui: &mut egui::Ui, text: &str, query: &str, case_sensitive: bo
             ui.visuals().dark_mode,
         )
     };
-    job.wrap.max_width = if wrap {
-        ui.available_width()
-    } else {
-        f32::INFINITY
+    job.wrap.max_width = ui.available_width();
+    if !wrap {
+        // 不换行时压成单行、超出部分用省略号收尾，等价于原先的 truncate
+        job.wrap.max_rows = 1;
+        job.wrap.overflow_character = Some('…');
+    }
+
+    let galley = ui.fonts(|f| f.layout_job(job));
+    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::click_and_drag());
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+
+    // 划选、复制与绘制都交给 egui，与 Label 内部的做法一致
+    egui::text_selection::LabelSelectionState::label_text_selection(
+        ui,
+        &response,
+        rect.min,
+        galley.clone(),
+        base_color,
+        egui::Stroke::NONE,
+    );
+
+    if response.double_clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            return word_at(&galley, pos - rect.min);
+        }
+    }
+    None
+}
+
+/// 取出 galley 中指定位置所在的词，按分隔符向两侧扩展。
+///
+/// 中文没有空格分词，连续的汉字会被整体取出——双击一段中文日志时，
+/// 这通常正是想拿去搜的片段。
+fn word_at(galley: &egui::Galley, pos: egui::Vec2) -> Option<String> {
+    let chars: Vec<char> = galley.text().chars().collect();
+    // ccursor.index 是字符偏移（不是字节偏移），恰好匹配 chars 的下标
+    let idx = galley.cursor_from_pos(pos).ccursor.index.min(chars.len());
+
+    let is_separator = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '[' | ']'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '\''
+                    | '"'
+                    | '='
+                    | '|'
+                    | '/'
+                    | '\\'
+            )
     };
 
-    let mut label = egui::Label::new(job).selectable(true);
-    if !wrap {
-        label = label.truncate();
+    let mut start = idx;
+    while start > 0 && !is_separator(chars[start - 1]) {
+        start -= 1;
     }
-    ui.add(label);
+    let mut end = idx;
+    while end < chars.len() && !is_separator(chars[end]) {
+        end += 1;
+    }
+    if start >= end {
+        return None;
+    }
+    Some(chars[start..end].iter().collect())
 }
 
 fn highlighted_job(
@@ -725,5 +822,66 @@ mod shortcut_tests {
 
         press(&ctx, &mut app, egui::Key::Slash, egui::Modifiers::NONE);
         assert!(app.focus_search, "/ 应请求聚焦搜索框");
+    }
+}
+
+#[cfg(test)]
+mod word_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn setup_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        // egui 的字体要等首次 run 之后才可用
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx
+    }
+
+    fn layout(ctx: &egui::Context, text: &str) -> Arc<egui::Galley> {
+        let font_id = egui::FontId::monospace(14.0);
+        ctx.fonts(|f| {
+            f.layout_job(egui::text::LayoutJob::single_section(
+                text.to_string(),
+                egui::TextFormat::simple(font_id, egui::Color32::WHITE),
+            ))
+        })
+    }
+
+    /// ASCII 字符宽度；等宽字体下汉字占两倍宽度
+    fn cw(ctx: &egui::Context) -> f32 {
+        ctx.fonts(|f| f.glyph_width(&egui::FontId::monospace(14.0), 'a'))
+    }
+
+    #[test]
+    fn picks_identifier_around_click() {
+        let ctx = setup_ctx();
+        let galley = layout(&ctx, "user=zhangsan status=OK");
+        // 落在 zhangsan 中间
+        let pos = egui::vec2(cw(&ctx) * 7.0, 5.0);
+        assert_eq!(word_at(&galley, pos).as_deref(), Some("zhangsan"));
+    }
+
+    /// 汉字各占两个 ASCII 宽度，若把字符索引当字节索引算，这里会错位
+    #[test]
+    fn picks_chinese_run_as_one_word() {
+        let ctx = setup_ctx();
+        let galley = layout(&ctx, "处理订单失败 orderId=123");
+        let pos = egui::vec2(cw(&ctx) * 1.0, 5.0);
+        assert_eq!(word_at(&galley, pos).as_deref(), Some("处理订单失败"));
+    }
+
+    #[test]
+    fn picks_value_after_equals_sign() {
+        let ctx = setup_ctx();
+        let galley = layout(&ctx, "orderId=12345 done");
+        let pos = egui::vec2(cw(&ctx) * 9.0, 5.0);
+        assert_eq!(word_at(&galley, pos).as_deref(), Some("12345"));
+    }
+
+    #[test]
+    fn returns_none_when_nothing_but_separators() {
+        let ctx = setup_ctx();
+        let galley = layout(&ctx, "     ");
+        assert_eq!(word_at(&galley, egui::vec2(1.0, 5.0)), None);
     }
 }
