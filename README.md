@@ -1,6 +1,6 @@
 # logview
 
-[![CI](https://github.com/iot_xush/logview/actions/workflows/ci.yml/badge.svg)](https://github.com/iot_xush/logview/actions/workflows/ci.yml)
+[![CI](https://github.com/yiwojiu/logview/actions/workflows/ci.yml/badge.svg)](https://github.com/yiwojiu/logview/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 
 跨平台大日志查看器。Rust + egui，macOS / Windows / Linux 三端同一套代码。
