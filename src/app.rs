@@ -1,4 +1,4 @@
-use crate::logstore::{encoding_name, LogStore};
+use crate::logstore::{encoding_name, LogStore, SearchRequest};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextStyle};
 use std::path::PathBuf;
@@ -24,6 +24,10 @@ pub struct LogViewApp {
     store: Option<LogStore>,
     query: String,
     case_sensitive: bool,
+    /// 把检索词当作正则表达式
+    use_regex: bool,
+    /// 正则模式下用于行内高亮的已编译表达式（编译失败时为 None）
+    highlight_regex: Option<regex::Regex>,
     only_matched: bool,
     follow: bool,
     wrap: bool,
@@ -58,6 +62,8 @@ impl Default for LogViewApp {
             store: None,
             query: String::new(),
             case_sensitive: false,
+            use_regex: false,
+            highlight_regex: None,
             only_matched: false,
             follow: true,
             wrap: false,
@@ -86,8 +92,9 @@ impl LogViewApp {
         match LogStore::open(path) {
             Ok(mut s) => {
                 if !self.query.is_empty() {
-                    s.start_search(&self.query, self.case_sensitive);
+                    s.start_search(self.search_request());
                 }
+                self.highlight_regex = self.compiled_highlight_regex();
                 self.scroll_offset = 0.0;
                 self.match_cursor = 0;
                 self.store = Some(s);
@@ -98,12 +105,41 @@ impl LogViewApp {
     }
 
     fn run_search(&mut self) {
+        // 后台线程会独立编译一次用于扫描整个文件；这里再编译一份供行内高亮使用
+        self.highlight_regex = self.compiled_highlight_regex();
+        // 先取出请求，避免与 &mut self.store 的借用冲突
+        let req = self.search_request();
         if let Some(s) = &mut self.store {
-            if s.start_search(&self.query, self.case_sensitive) {
+            if s.start_search(req) {
                 self.pending_first_match = true;
             }
         }
         self.match_cursor = 0;
+    }
+
+    /// 当前检索条件
+    fn search_request(&self) -> SearchRequest {
+        SearchRequest::new(&self.query, self.case_sensitive, self.use_regex)
+    }
+
+    /// 正则模式下编译一次用于高亮；编译失败返回 None，
+    /// 具体错误由 logstore 在后台报告给状态栏。
+    fn compiled_highlight_regex(&self) -> Option<regex::Regex> {
+        if !self.use_regex || self.query.is_empty() {
+            return None;
+        }
+        let pattern = if self.case_sensitive {
+            self.query.clone()
+        } else {
+            format!("(?i){}", self.query)
+        };
+        regex::Regex::new(&pattern).ok()
+    }
+
+    /// 当前匹配项所在的行号（用于高亮整行）
+    fn current_match_line(&self) -> Option<usize> {
+        let s = self.store.as_ref()?;
+        s.matches().get(self.match_cursor).map(|v| *v as usize)
     }
 
     /// 用给定的词直接发起检索（双击行内文字时调用）。
@@ -313,8 +349,17 @@ impl LogViewApp {
                 self.run_search();
             }
 
-            ui.checkbox(&mut self.case_sensitive, "区分大小写")
-                .on_hover_text("关闭时用 ASCII 小写匹配，速度略慢");
+            let cs = ui.checkbox(&mut self.case_sensitive, "区分大小写");
+            if cs.changed() {
+                // 选项会改变匹配结果，立刻按新条件重查
+                self.run_search();
+            }
+            let rx = ui
+                .checkbox(&mut self.use_regex, "正则")
+                .on_hover_text("把检索词当作正则表达式，例如 ERROR|FATAL\\d+");
+            if rx.changed() {
+                self.run_search();
+            }
             let om = ui.checkbox(&mut self.only_matched, "只显示匹配行");
             if om.changed() {
                 self.scroll_offset = 0.0;
@@ -381,7 +426,12 @@ impl LogViewApp {
             } else {
                 ui.label("就绪");
             }
-            if !self.query.is_empty() {
+            if let Some(err) = s.regex_error() {
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("正则无效：{err}")).color(ui.visuals().error_fg_color),
+                );
+            } else if !self.query.is_empty() {
                 ui.separator();
                 let n = s.matches().len();
                 if s.search_truncated() {
@@ -457,6 +507,9 @@ impl LogViewApp {
             area = area.vertical_scroll_offset(self.scroll_offset);
         }
 
+        // 当前匹配项所在的行：整行加底色，否则按 n 跳转之后看不出落在哪一条
+        let current_line = self.current_match_line();
+        let regex = self.highlight_regex.as_ref();
         let buf = &mut self.buf;
         let query = self.query.clone();
         let cs = self.case_sensitive;
@@ -479,6 +532,22 @@ impl LogViewApp {
                 if !store.read_line_into(line_idx, buf) {
                     continue;
                 }
+                if current_line == Some(line_idx) {
+                    // 与命中词的黄色高亮区分开，这里用冷色整行铺底
+                    let bg = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(30, 44, 62)
+                    } else {
+                        egui::Color32::from_rgb(226, 240, 253)
+                    };
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            ui.cursor().min,
+                            egui::vec2(ui.available_width(), row_h),
+                        ),
+                        0.0,
+                        bg,
+                    );
+                }
                 ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
                     ui.horizontal(|ui| {
                         ui.add_sized(
@@ -489,7 +558,7 @@ impl LogViewApp {
                                     .color(ui.visuals().weak_text_color()),
                             ),
                         );
-                        if let Some(word) = render_content(ui, buf, &query, cs, wrap) {
+                        if let Some(word) = render_content(ui, buf, &query, cs, wrap, regex) {
                             search_word = Some(word);
                         }
                     });
@@ -519,6 +588,7 @@ fn render_content(
     query: &str,
     case_sensitive: bool,
     wrap: bool,
+    regex: Option<&regex::Regex>,
 ) -> Option<String> {
     let mut shown = text;
     if shown.len() > MAX_RENDER_CHARS {
@@ -541,6 +611,7 @@ fn render_content(
             base_color,
             &font_id,
             ui.visuals().dark_mode,
+            regex,
         )
     };
     job.wrap.max_width = ui.available_width();
@@ -628,14 +699,8 @@ fn highlighted_job(
     base_color: Color32,
     font_id: &FontId,
     dark: bool,
+    regex: Option<&regex::Regex>,
 ) -> egui::text::LayoutJob {
-    // to_ascii_lowercase 不改变字节长度，可安全用于偏移换算
-    let (hay, needle) = if case_sensitive {
-        (text.to_string(), query.to_string())
-    } else {
-        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
-    };
-
     let hit_bg = if dark {
         Color32::from_rgb(140, 110, 20)
     } else {
@@ -653,6 +718,31 @@ fn highlighted_job(
             f.background = hit_bg;
         }
         job.append(s, 0.0, f);
+    };
+
+    // 正则模式：高亮范围由表达式自己给出，不必再做大小写归一化
+    if let Some(re) = regex {
+        let mut last = 0usize;
+        for m in re.find_iter(text) {
+            if m.start() > last {
+                push(&mut job, &text[last..m.start()], false);
+            }
+            if m.end() > m.start() {
+                push(&mut job, &text[m.start()..m.end()], true);
+            }
+            last = last.max(m.end());
+        }
+        if last < text.len() {
+            push(&mut job, &text[last..], false);
+        }
+        return job;
+    }
+
+    // to_ascii_lowercase 不改变字节长度，可安全用于偏移换算
+    let (hay, needle) = if case_sensitive {
+        (text.to_string(), query.to_string())
+    } else {
+        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
     };
 
     if needle.is_empty() {
@@ -745,7 +835,7 @@ mod shortcut_tests {
             panic!("后台任务超时");
         };
         wait(&mut store);
-        store.start_search("ERROR", true);
+        store.start_search(SearchRequest::new("ERROR", true, false));
         wait(&mut store);
         assert_eq!(store.matches().len(), 2, "前提：应有 2 个命中行");
 

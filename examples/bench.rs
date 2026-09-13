@@ -1,7 +1,7 @@
 //! 大文件压力验证：生成日志 → 打开 → 测首屏/全量索引/搜索/随机读耗时。
 //! 运行：cargo run --release --example bench [路径] [大小MB]
 
-use logview::logstore::LogStore;
+use logview::logstore::{LogStore, SearchRequest};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -97,10 +97,10 @@ fn main() {
         total_chars
     );
 
-    // 搜索
+    // 子串检索
     for q in ["ERROR", "张三丰", "orderId=12345"] {
         let t3 = Instant::now();
-        s.start_search(q, true);
+        s.start_search(SearchRequest::new(q, true, false));
         loop {
             s.pump();
             if !s.searching {
@@ -109,9 +109,49 @@ fn main() {
             std::thread::sleep(Duration::from_millis(2));
         }
         println!(
-            "搜索 {q:<16} 命中 {:>7} 行  耗时 {:.3}s",
+            "子串 {q:<16} 命中 {:>7} 行  耗时 {:.3}s",
             s.matches().len(),
             t3.elapsed().as_secs_f64()
+        );
+    }
+
+    // 正则检索：逐行解码 + 自动机，比字节匹配慢多少，量一下就知道了
+    for pat in ["ERROR|WARN", "orderId=\\d+", "耗时=\\d{3}ms"] {
+        let t4 = Instant::now();
+        s.start_search(SearchRequest::new(pat, true, true));
+        loop {
+            s.pump();
+            if !s.searching {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "正则 {pat:<16} 命中 {:>7} 行  耗时 {:.3}s",
+            s.matches().len(),
+            t4.elapsed().as_secs_f64()
+        );
+    }
+
+    // 上面那些模式都撞到命中上限提前退出了，看不出扫完整个文件的代价。
+    // 换成几乎不命中的模式，两种方式的真实差距才显示出来。
+    for (label, pat, is_regex) in [
+        ("子串(零命中)", "zzzznomatch", false),
+        ("正则(零命中)", r"zzzz\d{3}|qqqqq", true),
+    ] {
+        let t5 = Instant::now();
+        s.start_search(SearchRequest::new(pat, true, is_regex));
+        loop {
+            s.pump();
+            if !s.searching {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "{label:<16} 命中 {:>7} 行  耗时 {:.3}s",
+            s.matches().len(),
+            t5.elapsed().as_secs_f64()
         );
     }
 

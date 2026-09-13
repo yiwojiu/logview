@@ -19,8 +19,28 @@ pub enum IndexMsg {
 }
 
 pub enum SearchMsg {
-    /// 命中的字节偏移（升序）
+    /// 命中的行起始偏移（升序）
     Hits(Vec<usize>),
+    /// 正则表达式编译失败
+    RegexError(String),
+}
+
+/// 一次检索的请求参数
+#[derive(Clone, Debug)]
+pub struct SearchRequest {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub use_regex: bool,
+}
+
+impl SearchRequest {
+    pub fn new(query: impl Into<String>, case_sensitive: bool, use_regex: bool) -> Self {
+        Self {
+            query: query.into(),
+            case_sensitive,
+            use_regex,
+        }
+    }
 }
 
 /// 日志文件的只读视图。
@@ -50,7 +70,9 @@ pub struct LogStore {
     /// 命中数是否达到上限而被截断
     search_truncated: bool,
     /// 索引尚未建完时挂起的检索条件，索引完成后自动执行
-    pending_search: Option<(String, bool)>,
+    pending_search: Option<SearchRequest>,
+    /// 上一次正则检索的编译错误
+    regex_error: Option<String>,
 }
 
 impl LogStore {
@@ -81,6 +103,7 @@ impl LogStore {
             matches: Vec::new(),
             search_truncated: false,
             pending_search: None,
+            regex_error: None,
         })
     }
 
@@ -127,16 +150,7 @@ impl LogStore {
         if s > e || e > self.mmap.len() {
             return false;
         }
-        let raw = trim_eol(&self.mmap[s..e]);
-        if is_utf8(self.encoding) {
-            match std::str::from_utf8(raw) {
-                Ok(t) => out.push_str(t),
-                Err(_) => out.push_str(&String::from_utf8_lossy(raw)),
-            }
-        } else {
-            let (cow, _, _) = self.encoding.decode(raw);
-            out.push_str(&cow);
-        }
+        decode_into(trim_eol(&self.mmap[s..e]), self.encoding, out);
         true
     }
 
@@ -159,15 +173,18 @@ impl LogStore {
                 self.indexing = false;
                 self.rx = None;
                 // 索引刚建完，补跑此前挂起的检索
-                if let Some((q, cs)) = self.pending_search.take() {
-                    self.spawn_search(&q, cs);
+                if let Some(req) = self.pending_search.take() {
+                    self.spawn_search(req);
                 }
                 changed = true;
             }
         }
         if let Some(rx) = &self.search_rx {
-            if let Ok(SearchMsg::Hits(hits)) = rx.try_recv() {
-                self.apply_hits(hits);
+            if let Ok(msg) = rx.try_recv() {
+                match msg {
+                    SearchMsg::Hits(hits) => self.apply_hits(hits),
+                    SearchMsg::RegexError(e) => self.regex_error = Some(e),
+                }
                 self.searching = false;
                 self.search_rx = None;
                 changed = true;
@@ -228,17 +245,17 @@ impl LogStore {
     /// 若行索引尚未建完，检索会先挂起，待索引完成后自动执行：
     /// 此时文件只有一部分被扫描过，直接检索会给出偏少的命中数，
     /// 而界面上看不出任何异常——那比"慢一点出结果"危险得多。
-    pub fn start_search(&mut self, query: &str, case_sensitive: bool) -> bool {
-        if query.is_empty() {
+    pub fn start_search(&mut self, req: SearchRequest) -> bool {
+        if req.query.is_empty() {
             self.clear_search();
             return false;
         }
         if self.indexing {
-            self.pending_search = Some((query.to_string(), case_sensitive));
+            self.pending_search = Some(req);
             self.searching = true;
             return true;
         }
-        self.spawn_search(query, case_sensitive)
+        self.spawn_search(req)
     }
 
     /// 是否有检索正在等待索引完成
@@ -246,29 +263,47 @@ impl LogStore {
         self.pending_search.is_some()
     }
 
-    fn spawn_search(&mut self, query: &str, case_sensitive: bool) -> bool {
-        let pattern: Vec<u8> = if is_utf8(self.encoding) {
-            query.as_bytes().to_vec()
-        } else {
-            self.encoding.encode(query).0.into_owned()
-        };
-        if pattern.is_empty() {
-            return false;
-        }
+    /// 上一次正则检索的编译错误，供界面提示
+    pub fn regex_error(&self) -> Option<&str> {
+        self.regex_error.as_deref()
+    }
+
+    fn spawn_search(&mut self, req: SearchRequest) -> bool {
         let (tx, rx) = channel::<SearchMsg>();
         let mmap = self.mmap.clone();
         // 索引已完成，此时可覆盖整个文件（含末尾无换行符的最后一行）
         let limit = self.real_len;
+        let encoding = self.encoding;
         self.search_rx = Some(rx);
         self.searching = true;
         self.pending_search = None;
+        self.regex_error = None;
         std::thread::spawn(move || {
-            let hits = if case_sensitive {
-                search_bytes(&mmap, limit, &pattern)
+            let msg = if req.use_regex {
+                // 忽略大小写交给正则自己的标志位处理
+                let pattern = if req.case_sensitive {
+                    req.query.clone()
+                } else {
+                    format!("(?i){}", req.query)
+                };
+                match regex::Regex::new(&pattern) {
+                    Ok(re) => SearchMsg::Hits(search_regex(&mmap, limit, &re, encoding)),
+                    Err(e) => SearchMsg::RegexError(e.to_string()),
+                }
             } else {
-                search_bytes_ci(&mmap, limit, &pattern)
+                let pattern: Vec<u8> = if is_utf8(encoding) {
+                    req.query.as_bytes().to_vec()
+                } else {
+                    encoding.encode(&req.query).0.into_owned()
+                };
+                let hits = if req.case_sensitive {
+                    search_bytes(&mmap, limit, &pattern)
+                } else {
+                    search_bytes_ci(&mmap, limit, &pattern)
+                };
+                SearchMsg::Hits(hits)
             };
-            let _ = tx.send(SearchMsg::Hits(hits));
+            let _ = tx.send(msg);
         });
         true
     }
@@ -283,6 +318,7 @@ impl LogStore {
         self.search_rx = None;
         self.search_truncated = false;
         self.pending_search = None;
+        self.regex_error = None;
     }
 
     /// 命中数是否撞上上限（此时显示的数字是不完整的）
@@ -385,6 +421,51 @@ fn search_bytes_ci(mmap: &[u8], limit: usize, pattern: &[u8]) -> Vec<usize> {
         i = end + 1;
     }
     hits
+}
+
+/// 正则检索：逐行解码之后再匹配，返回命中的行起始偏移。
+///
+/// 没有像普通检索那样直接匹配原始字节，原因是正则表达式本身是 UTF-8 文本，
+/// 而 GB18030 日志里的汉字是多字节的，在字节流上匹配无法正确对应。
+/// 逐行解码慢一些，但换来编码无关——中文正则也能用。
+fn search_regex(
+    mmap: &[u8],
+    limit: usize,
+    re: &regex::Regex,
+    encoding: &'static Encoding,
+) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut line = String::with_capacity(256);
+    let mut i = 0usize;
+    while i < limit {
+        let end = match memchr::memchr(b'\n', &mmap[i..limit]) {
+            Some(rel) => i + rel,
+            None => limit,
+        };
+        line.clear();
+        decode_into(trim_eol(&mmap[i..end]), encoding, &mut line);
+        if re.is_match(&line) {
+            hits.push(i);
+            if hits.len() >= MAX_SEARCH_HITS {
+                break;
+            }
+        }
+        i = end + 1;
+    }
+    hits
+}
+
+/// 按文件编码把一段原始字节解码后追加到 out
+fn decode_into(raw: &[u8], encoding: &'static Encoding, out: &mut String) {
+    if is_utf8(encoding) {
+        match std::str::from_utf8(raw) {
+            Ok(t) => out.push_str(t),
+            Err(_) => out.push_str(&String::from_utf8_lossy(raw)),
+        }
+    } else {
+        let (cow, _, _) = encoding.decode(raw);
+        out.push_str(&cow);
+    }
 }
 
 /// 编码嗅探：优先 UTF-8，失败回退 GB18030（覆盖 Windows 中文环境的 GBK 日志）

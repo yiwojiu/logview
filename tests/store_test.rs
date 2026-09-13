@@ -1,4 +1,4 @@
-use logview::logstore::{encoding_name, is_utf8, LogStore};
+use logview::logstore::{encoding_name, is_utf8, LogStore, SearchRequest};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -100,11 +100,11 @@ fn search_case_sensitive() {
     let data = b"INFO start\nERROR boom\nwarn maybe\nerror lower\n";
     let mut s = open(data, "search.log");
 
-    s.start_search("ERROR", true);
+    s.start_search(SearchRequest::new("ERROR", true, false));
     settle(&mut s, Duration::from_secs(5));
     assert_eq!(s.matches(), &[1], "区分大小写时只应命中第 2 行");
 
-    s.start_search("error", false);
+    s.start_search(SearchRequest::new("error", false, false));
     settle(&mut s, Duration::from_secs(5));
     assert_eq!(s.matches(), &[1, 3], "忽略大小写时两行都应命中");
 }
@@ -112,7 +112,7 @@ fn search_case_sensitive() {
 #[test]
 fn search_deduplicates_multiple_hits_per_line() {
     let mut s = open(b"error error error\nok\n", "dup.log");
-    s.start_search("error", true);
+    s.start_search(SearchRequest::new("error", true, false));
     settle(&mut s, Duration::from_secs(5));
     assert_eq!(s.matches(), &[0], "同一行多次命中只应出现一次");
 }
@@ -121,9 +121,65 @@ fn search_deduplicates_multiple_hits_per_line() {
 fn search_chinese_query() {
     let (bytes, _, _) = encoding_rs::GB18030.encode("第一条\n错误日志\n第三条\n");
     let mut s = open(&bytes, "cn.log");
-    s.start_search("错误", true);
+    s.start_search(SearchRequest::new("错误", true, false));
     settle(&mut s, Duration::from_secs(5));
     assert_eq!(s.matches(), &[1]);
+}
+
+#[test]
+fn regex_search_supports_alternation() {
+    let mut s = open(
+        b"INFO ok\nERROR bad\nFATAL worse\nWARN meh\n",
+        "regex_alt.log",
+    );
+    s.start_search(SearchRequest::new("ERROR|FATAL", true, true));
+    settle(&mut s, Duration::from_secs(5));
+    assert_eq!(s.matches(), &[1, 2], "多选分支应同时命中两行");
+}
+
+#[test]
+fn regex_search_can_anchor_and_ignore_case() {
+    let mut s = open(b"error\nERROR\nError happened\n", "regex_anchor.log");
+    s.start_search(SearchRequest::new("^error$", false, true));
+    settle(&mut s, Duration::from_secs(5));
+    assert_eq!(
+        s.matches(),
+        &[0, 1],
+        "忽略大小写时前两行命中，第三行不匹配 ^$"
+    );
+}
+
+#[test]
+fn regex_search_reports_invalid_pattern() {
+    let mut s = open(b"anything\n", "regex_bad.log");
+    assert!(s.start_search(SearchRequest::new("(unclosed", true, true)));
+    settle(&mut s, Duration::from_secs(5));
+    assert!(s.regex_error().is_some(), "非法正则应当报错");
+    assert!(s.matches().is_empty(), "报错时不应留下命中结果");
+}
+
+/// GB18030 日志里的中文正则也要能用——这正是逐行解码而非字节匹配换来的能力
+#[test]
+fn regex_search_handles_chinese_in_gbk_file() {
+    let (bytes, _, _) = encoding_rs::GB18030.encode("错误日志\n一切正常\n错误又来了\n");
+    let mut s = open(&bytes, "regex_cn.log");
+    s.start_search(SearchRequest::new("^错误", true, true));
+    settle(&mut s, Duration::from_secs(5));
+    assert_eq!(s.matches(), &[0, 2]);
+}
+
+/// 切换检索方式后不应残留上一次的正则错误
+#[test]
+fn switching_back_to_plain_search_clears_regex_error() {
+    let mut s = open(b"ERROR\n", "regex_clear.log");
+    s.start_search(SearchRequest::new("(unclosed", true, true));
+    settle(&mut s, Duration::from_secs(5));
+    assert!(s.regex_error().is_some());
+
+    s.start_search(SearchRequest::new("ERROR", true, false));
+    settle(&mut s, Duration::from_secs(5));
+    assert!(s.regex_error().is_none(), "回到子串检索后错误应被清掉");
+    assert_eq!(s.matches(), &[0]);
 }
 
 #[test]
@@ -139,7 +195,7 @@ fn search_before_index_finishes_still_returns_every_hit() {
     let mut s = LogStore::open(p).unwrap();
     assert!(s.indexing, "前提：打开后索引应仍在进行中");
 
-    s.start_search("ERROR", true);
+    s.start_search(SearchRequest::new("ERROR", true, false));
     assert!(s.search_pending(), "索引尚未完成时检索应当被挂起");
 
     settle(&mut s, Duration::from_secs(30));
@@ -155,7 +211,7 @@ fn clearing_search_cancels_a_pending_one() {
     let p = write_tmp("pending_cancel.log", &data);
 
     let mut s = LogStore::open(p).unwrap();
-    s.start_search("ERROR", true);
+    s.start_search(SearchRequest::new("ERROR", true, false));
     assert!(s.search_pending());
 
     s.clear_search();
@@ -168,7 +224,7 @@ fn clearing_search_cancels_a_pending_one() {
 #[test]
 fn no_match_returns_empty() {
     let mut s = open(b"a\nb\n", "nomatch.log");
-    s.start_search("zzzz", true);
+    s.start_search(SearchRequest::new("zzzz", true, false));
     settle(&mut s, Duration::from_secs(5));
     assert!(s.matches().is_empty());
 }
