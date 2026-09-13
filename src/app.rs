@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 /// 单行最大渲染字符数，超出截断，避免超长行拖慢渲染
 const MAX_RENDER_CHARS: usize = 4000;
 
+/// 搜索框的固定 Id，用于快捷键聚焦与失焦
+const SEARCH_ID: &str = "logview_search";
+
 pub struct LogViewApp {
     store: Option<LogStore>,
     query: String,
@@ -28,6 +31,13 @@ pub struct LogViewApp {
     /// 纵向滚动偏移，手动维护以便跳转
     scroll_offset: f32,
 
+    /// 搜索框当前是否持有焦点（决定裸字母键是否作为快捷键）
+    search_has_focus: bool,
+    /// 请求在下一帧把焦点交给搜索框
+    focus_search: bool,
+    /// 请求跳到文件末尾（需在得知总行数后处理）
+    jump_to_end: bool,
+
     last_refresh: Instant,
     buf: String,
 }
@@ -48,6 +58,9 @@ impl Default for LogViewApp {
             pending_first_match: false,
             match_cursor: 0,
             scroll_offset: 0.0,
+            search_has_focus: false,
+            focus_search: false,
+            jump_to_end: false,
             last_refresh: Instant::now(),
             buf: String::with_capacity(1024),
         }
@@ -110,6 +123,69 @@ impl LogViewApp {
             self.pending_jump = Some(line);
         }
     }
+
+    /// 跳到指定位置（同时退出跟随，否则会被 tail 拉回底部）
+    fn jump_to_line(&mut self, idx: usize) {
+        self.follow = false;
+        self.pending_jump = Some(idx);
+    }
+
+    /// 全局快捷键。
+    ///
+    /// 裸字母键只在搜索框没有焦点时才作为快捷键，否则会抢走正常输入。
+    /// 修饰键组合（⌘F / ⌘O）任何时候都生效。
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+            if let Some(p) = rfd::FileDialog::new().pick_file() {
+                self.open_path(p);
+            }
+        }
+
+        let focus_hotkey = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F))
+            || (!self.search_has_focus
+                && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Slash)));
+
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.query.clear();
+            if let Some(s) = &mut self.store {
+                s.clear_search();
+            }
+            self.search_has_focus = false;
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(SEARCH_ID)));
+            return;
+        }
+
+        if focus_hotkey {
+            self.focus_search = true;
+            return;
+        }
+
+        if self.search_has_focus {
+            return;
+        }
+
+        // 注意：egui 的 consume_key(Modifiers::NONE, ..) 会**忽略**修饰键，
+        // 所以不能写成"先匹配 NONE、再匹配 SHIFT"——Shift+N 会被前一条吃掉。
+        // 正确做法是用 NONE 消费，再读 shift 状态决定方向。
+        let shift = ctx.input(|i| i.modifiers.shift);
+
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::N)) {
+            if shift {
+                self.goto_match(-1);
+            } else {
+                self.goto_match(1);
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G)) {
+            if shift {
+                self.jump_to_end = true;
+            } else {
+                self.jump_to_line(0);
+            }
+        }
+    }
 }
 
 impl eframe::App for LogViewApp {
@@ -152,6 +228,9 @@ impl eframe::App for LogViewApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ctx, ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
         egui::CentralPanel::default().show(ctx, |ui| self.log_area(ui));
+
+        // 快捷键放在各面板之后：此时 search_has_focus 已是本帧的最新状态
+        self.handle_shortcuts(ctx);
 
         // 保持 tail 跟随与索引进度的刷新
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -197,9 +276,15 @@ impl LogViewApp {
         ui.horizontal_wrapped(|ui| {
             let resp = ui.add(
                 TextEdit::singleline(&mut self.query)
-                    .hint_text("搜索（支持中文，大小写不敏感默认关闭）")
+                    .id(egui::Id::new(SEARCH_ID))
+                    .hint_text("搜索（⌘F 或 / 聚焦，n / N 跳转）")
                     .desired_width(320.0),
             );
+            if self.focus_search {
+                resp.request_focus();
+                self.focus_search = false;
+            }
+            self.search_has_focus = resp.has_focus();
             if resp.changed() {
                 self.search_dirty = Some(Instant::now());
             }
@@ -237,6 +322,15 @@ impl LogViewApp {
                     s.clear_search();
                 }
             }
+
+            let _ = ui.button("?").on_hover_text(
+                "快捷键\n\
+                 ⌘F 或 /    聚焦搜索框\n\
+                 n / N      下 / 上一个命中\n\
+                 g / G      跳到开头 / 末尾\n\
+                 Esc        清空检索\n\
+                 ⌘O         打开文件",
+            );
         });
         ui.add_space(4.0);
         let _ = ctx;
@@ -255,7 +349,11 @@ impl LogViewApp {
             ui.label(encoding_name(s.encoding));
             ui.separator();
             if s.indexing {
-                ui.label("索引中…");
+                ui.label(if s.search_pending() {
+                    "索引中（完成后自动检索）…"
+                } else {
+                    "索引中…"
+                });
             } else if s.searching {
                 ui.label("搜索中…");
             } else {
@@ -311,6 +409,12 @@ impl LogViewApp {
             return;
         }
 
+        // G 跳到末尾：需要先知道总行数，所以放到这里处理
+        if self.jump_to_end {
+            self.jump_to_end = false;
+            self.jump_to_line(total.saturating_sub(1));
+        }
+
         let row_h = ui.text_style_height(&TextStyle::Monospace) + 3.0;
         let gutter_w = (format!("{total}").len() as f32) * 8.0 + 12.0;
 
@@ -321,8 +425,8 @@ impl LogViewApp {
             self.scroll_offset = (target as f32 * row_h - 120.0).max(0.0);
         }
 
-        let avail_h = ui.available_height();
-        let stick = self.follow && !self.only_matched && self.pending_jump.is_none();
+        // pending_jump 已在上面取走并转成偏移量，此处只看跟随开关
+        let stick = self.follow && !self.only_matched;
         let mut area = ScrollArea::vertical()
             .id_salt("log_scroll")
             .auto_shrink([false, false])
@@ -364,7 +468,6 @@ impl LogViewApp {
                         render_content(ui, buf, &query, cs, wrap);
                     });
                 });
-                let _ = avail_h;
             }
         });
 
@@ -507,5 +610,110 @@ fn human_size(n: usize) -> String {
         format!("{:.1} MB", n / KB / KB)
     } else {
         format!("{:.2} GB", n / KB / KB / KB)
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+
+    /// 造一个带两个命中行的 app。
+    ///
+    /// `tag` 用于区分文件名：测试是并行执行的，若共用同一个临时文件，
+    /// 会互相覆盖内容导致随机失败。
+    fn app_with_hits(tag: &str) -> LogViewApp {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logview_shortcut_{tag}.log"));
+        std::fs::write(&p, b"ERROR one\nplain\nERROR two\n").unwrap();
+
+        let mut store = LogStore::open(p).unwrap();
+        let wait = |store: &mut LogStore| {
+            for _ in 0..2000 {
+                store.pump();
+                if !store.indexing && !store.searching {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("后台任务超时");
+        };
+        wait(&mut store);
+        store.start_search("ERROR", true);
+        wait(&mut store);
+        assert_eq!(store.matches().len(), 2, "前提：应有 2 个命中行");
+
+        let mut app = LogViewApp::new();
+        app.query = "ERROR".to_string();
+        app.store = Some(store);
+        app
+    }
+
+    fn press(
+        ctx: &egui::Context,
+        app: &mut LogViewApp,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        let raw = egui::RawInput {
+            // 必须一并设置：egui 会用 RawInput.modifiers 覆盖事件自带的修饰键，
+            // 只设事件里那个的话，Shift+N 会被当成普通 n。
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(raw, |ctx| app.handle_shortcuts(ctx));
+    }
+
+    /// 关键边界：搜索框有焦点时按字母必须当作普通输入，不能触发跳转，
+    /// 否则用户根本没法在搜索框里打出 n 或 g。
+    #[test]
+    fn letter_keys_are_ignored_while_search_box_is_focused() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("focused");
+        app.search_has_focus = true;
+        let before = app.match_cursor;
+
+        press(&ctx, &mut app, egui::Key::N, egui::Modifiers::NONE);
+        assert_eq!(app.match_cursor, before, "搜索框有焦点时 n 不应跳转");
+        assert!(app.pending_jump.is_none());
+    }
+
+    #[test]
+    fn letter_keys_work_when_search_box_is_not_focused() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("nofocus");
+        app.search_has_focus = false;
+
+        assert_eq!(app.match_cursor, 0);
+        press(&ctx, &mut app, egui::Key::N, egui::Modifiers::NONE);
+        assert_eq!(app.match_cursor, 1, "无焦点时 n 应跳到下一个命中");
+        assert!(app.pending_jump.is_some(), "跳转请求应已排队");
+    }
+
+    #[test]
+    fn shift_n_goes_backwards() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("shiftn");
+        app.search_has_focus = false;
+        app.match_cursor = 1;
+
+        press(&ctx, &mut app, egui::Key::N, egui::Modifiers::SHIFT);
+        assert_eq!(app.match_cursor, 0, "Shift+N 应回到上一个命中");
+    }
+
+    #[test]
+    fn slash_requests_search_focus() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("slash");
+        app.search_has_focus = false;
+
+        press(&ctx, &mut app, egui::Key::Slash, egui::Modifiers::NONE);
+        assert!(app.focus_search, "/ 应请求聚焦搜索框");
     }
 }

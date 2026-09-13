@@ -49,6 +49,8 @@ pub struct LogStore {
     matches: Vec<u32>,
     /// 命中数是否达到上限而被截断
     search_truncated: bool,
+    /// 索引尚未建完时挂起的检索条件，索引完成后自动执行
+    pending_search: Option<(String, bool)>,
 }
 
 impl LogStore {
@@ -78,6 +80,7 @@ impl LogStore {
             searching: false,
             matches: Vec::new(),
             search_truncated: false,
+            pending_search: None,
         })
     }
 
@@ -155,6 +158,10 @@ impl LogStore {
                 self.scanned = pos;
                 self.indexing = false;
                 self.rx = None;
+                // 索引刚建完，补跑此前挂起的检索
+                if let Some((q, cs)) = self.pending_search.take() {
+                    self.spawn_search(&q, cs);
+                }
                 changed = true;
             }
         }
@@ -182,10 +189,12 @@ impl LogStore {
             return;
         };
         if len < self.real_len {
-            // 被截断或轮转，整体重建
+            // 被截断或轮转，整体重建（旧结果与挂起条件都随之失效）
             self.line_starts.clear();
             self.scanned = 0;
             self.matches.clear();
+            self.search_truncated = false;
+            self.pending_search = None;
             if self.remap(file).is_ok() {
                 self.spawn_index(0);
             }
@@ -214,12 +223,30 @@ impl LogStore {
         std::thread::spawn(move || scan_lines(mmap, start, limit, tx));
     }
 
-    /// 启动一次后台搜索，返回是否真的启动
+    /// 启动一次后台检索，返回是否真的启动了。
+    ///
+    /// 若行索引尚未建完，检索会先挂起，待索引完成后自动执行：
+    /// 此时文件只有一部分被扫描过，直接检索会给出偏少的命中数，
+    /// 而界面上看不出任何异常——那比"慢一点出结果"危险得多。
     pub fn start_search(&mut self, query: &str, case_sensitive: bool) -> bool {
         if query.is_empty() {
             self.clear_search();
             return false;
         }
+        if self.indexing {
+            self.pending_search = Some((query.to_string(), case_sensitive));
+            self.searching = true;
+            return true;
+        }
+        self.spawn_search(query, case_sensitive)
+    }
+
+    /// 是否有检索正在等待索引完成
+    pub fn search_pending(&self) -> bool {
+        self.pending_search.is_some()
+    }
+
+    fn spawn_search(&mut self, query: &str, case_sensitive: bool) -> bool {
         let pattern: Vec<u8> = if is_utf8(self.encoding) {
             query.as_bytes().to_vec()
         } else {
@@ -230,9 +257,11 @@ impl LogStore {
         }
         let (tx, rx) = channel::<SearchMsg>();
         let mmap = self.mmap.clone();
-        let limit = self.scanned.min(self.real_len);
+        // 索引已完成，此时可覆盖整个文件（含末尾无换行符的最后一行）
+        let limit = self.real_len;
         self.search_rx = Some(rx);
         self.searching = true;
+        self.pending_search = None;
         std::thread::spawn(move || {
             let hits = if case_sensitive {
                 search_bytes(&mmap, limit, &pattern)
@@ -253,6 +282,7 @@ impl LogStore {
         self.searching = false;
         self.search_rx = None;
         self.search_truncated = false;
+        self.pending_search = None;
     }
 
     /// 命中数是否撞上上限（此时显示的数字是不完整的）

@@ -127,6 +127,45 @@ fn search_chinese_query() {
 }
 
 #[test]
+fn search_before_index_finishes_still_returns_every_hit() {
+    // 打开文件后索引一定还在进行（索引线程需要被 pump 才会把 Done 交给 store），
+    // 此时发起的检索必须被挂起，而不是拿"已扫描部分"得出一个偏少的命中数。
+    let mut data = Vec::new();
+    for i in 0..20_000 {
+        data.extend_from_slice(format!("line {i} ERROR\n").as_bytes());
+    }
+    let p = write_tmp("pending.log", &data);
+
+    let mut s = LogStore::open(p).unwrap();
+    assert!(s.indexing, "前提：打开后索引应仍在进行中");
+
+    s.start_search("ERROR", true);
+    assert!(s.search_pending(), "索引尚未完成时检索应当被挂起");
+
+    settle(&mut s, Duration::from_secs(30));
+    assert_eq!(s.matches().len(), 20_000, "索引完成后应命中全部行");
+}
+
+#[test]
+fn clearing_search_cancels_a_pending_one() {
+    let mut data = Vec::new();
+    for i in 0..20_000 {
+        data.extend_from_slice(format!("line {i} ERROR\n").as_bytes());
+    }
+    let p = write_tmp("pending_cancel.log", &data);
+
+    let mut s = LogStore::open(p).unwrap();
+    s.start_search("ERROR", true);
+    assert!(s.search_pending());
+
+    s.clear_search();
+    assert!(!s.search_pending(), "清空检索时应一并撤销挂起的条件");
+
+    settle(&mut s, Duration::from_secs(30));
+    assert!(s.matches().is_empty(), "被撤销的检索不应产生结果");
+}
+
+#[test]
 fn no_match_returns_empty() {
     let mut s = open(b"a\nb\n", "nomatch.log");
     s.start_search("zzzz", true);
