@@ -112,9 +112,14 @@ shasum -a 256 -c SHA256SUMS.txt        # macOS
 sha256sum -c SHA256SUMS.txt            # Linux
 ```
 
-> macOS 产物只做了 ad-hoc 签名，没有 Apple 开发者签名和公证。首次打开需在
-> Finder 中右键选择「打开」；若系统提示应用已损坏，执行
-> `xattr -cr logview.app` 之后再打开。
+> **macOS 首次打开的额外一步。** 产物只做了 ad-hoc 签名，没有 Apple 开发者
+> 签名与公证，因此 Gatekeeper 会拦下第一次启动——这是预期行为，不表示文件损坏。
+>
+> 处理方式：把 `logview.app` 拖入「应用程序」，然后打开
+> **系统设置 → 隐私与安全性**，在页面下方找到关于 logview 的提示，点击「仍要打开」。
+> 之后即可正常双击启动，不会再被拦。
+>
+> 想免除这一步需要 Apple 开发者账号做正式签名与公证（年费 99 美元）。
 
 ### 从源码构建
 
