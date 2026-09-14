@@ -188,7 +188,7 @@ Windows 与 Linux 上 `⌘` 对应 `Ctrl`。
 ```bash
 cargo fmt --all -- --check    # 格式检查
 cargo clippy --all-targets    # 静态检查
-cargo test                    # 运行测试（11 项集成测试）
+cargo test                    # 运行测试（单元测试 + 18 项集成测试）
 
 # 中文字体自检；退出码非 0 表示字体未生效
 cargo run --example fontcheck

@@ -766,7 +766,9 @@ fn highlighted_job(
 
 /// 按日志级别给整行上色
 fn level_color(ui: &egui::Ui, line: &str) -> Option<Color32> {
-    let head = &line[..line.len().min(200)];
+    // 只取行首一小段做级别判定即可。截断必须落在字符边界上：
+    // 中文日志里第 200 个字节经常正好落在一个汉字的中间，直接切片会 panic。
+    let head = floor_char_boundary(line, 200);
     let v = ui.visuals();
     if head.contains("FATAL") || head.contains("ERROR") || head.contains("SEVERE") {
         Some(v.error_fg_color)
@@ -973,5 +975,25 @@ mod word_tests {
         let ctx = setup_ctx();
         let galley = layout(&ctx, "     ");
         assert_eq!(word_at(&galley, egui::vec2(1.0, 5.0)), None);
+    }
+
+    /// 级别判定只取行首一小段，中文日志里第 200 个字节常常正落在汉字中间。
+    /// 按字节直接切片会 panic——打开文件即闪退，正是这个原因。
+    #[test]
+    fn level_color_truncates_on_char_boundary() {
+        let ctx = setup_ctx();
+        // 前 198 字节为 ASCII，紧随其后的汉字占据 198..201，第 200 字节在其内部
+        let line = format!("ERROR {}{}", "a".repeat(192), "查找");
+        assert!(line.len() > 200);
+        assert!(!line.is_char_boundary(200), "前提：构造的行应跨越字符边界");
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(
+                    level_color(ui, &line).is_some(),
+                    "行首含 ERROR，应当照常着色而不是崩溃"
+                );
+            });
+        });
     }
 }
