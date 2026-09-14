@@ -20,6 +20,18 @@ const CMD: &str = if cfg!(target_os = "macos") {
     "Ctrl+"
 };
 
+/// 检索结果到位后，视图往哪里去。
+///
+/// 两种入口的期望不一样：在搜索框里敲词是想"找到它"，跳过去理所当然；
+/// 双击行内的词是想"看看这个词还出现在哪"，人正读到半截，跳走等于把人拽走。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnSearchDone {
+    /// 跳到全文件的第一个命中（搜索框输入、切换检索选项）
+    GotoFirstMatch,
+    /// 视图原地不动，只把游标对齐到当前视口（双击取词）
+    StayAtView,
+}
+
 pub struct LogViewApp {
     store: Option<LogStore>,
     query: String,
@@ -40,12 +52,14 @@ pub struct LogViewApp {
     search_dirty: Option<Instant>,
     /// 当前跳转目标行
     pending_jump: Option<usize>,
-    /// 搜索完成后是否自动定位到第一个命中
-    pending_first_match: bool,
+    /// 检索结果到位后的去向；None 表示这一轮已经处理过
+    pending_after_search: Option<OnSearchDone>,
     /// 匹配项游标（用于上一个/下一个）
     match_cursor: usize,
     /// 纵向滚动偏移，手动维护以便跳转
     scroll_offset: f32,
+    /// 视口顶部对应的文件行号，双击取词后用它把游标对齐到当前位置
+    top_line: usize,
 
     /// 搜索框当前是否持有焦点（决定裸字母键是否作为快捷键）
     search_has_focus: bool,
@@ -73,9 +87,10 @@ impl Default for LogViewApp {
             error: None,
             search_dirty: None,
             pending_jump: None,
-            pending_first_match: false,
+            pending_after_search: None,
             match_cursor: 0,
             scroll_offset: 0.0,
+            top_line: 0,
             search_has_focus: false,
             focus_search: false,
             jump_to_end: false,
@@ -106,17 +121,48 @@ impl LogViewApp {
         }
     }
 
-    fn run_search(&mut self) {
+    /// 执行检索，并记下结果到位后视图的去向。
+    fn run_search(&mut self, on_done: OnSearchDone) {
         // 后台线程会独立编译一次用于扫描整个文件；这里再编译一份供行内高亮使用
         self.highlight_regex = self.compiled_highlight_regex();
         // 先取出请求，避免与 &mut self.store 的借用冲突
         let req = self.search_request();
         if let Some(s) = &mut self.store {
             if s.start_search(req) {
-                self.pending_first_match = true;
+                self.pending_after_search = Some(on_done);
             }
         }
-        self.match_cursor = 0;
+        if on_done == OnSearchDone::GotoFirstMatch {
+            self.match_cursor = 0;
+        }
+    }
+
+    /// 检索结束后决定视图去向。每帧调用一次，没在等结果时什么都不做。
+    fn apply_search_outcome(&mut self) {
+        if self.store.as_ref().map(|s| s.searching).unwrap_or(false) {
+            return;
+        }
+        match self.pending_after_search.take() {
+            Some(OnSearchDone::GotoFirstMatch) => self.goto_match(0),
+            Some(OnSearchDone::StayAtView) => self.cursor_from_view(),
+            None => {}
+        }
+    }
+
+    /// 把游标对齐到当前视口：取视口之下的第一个命中作为"当前项"。
+    ///
+    /// 视图一动不动，但游标落在一个看得到的位置上，于是 `n` 是"往下找下一个命中"，
+    /// `N` 是"往上找上一个"，而不是从文件开头重新数。
+    fn cursor_from_view(&mut self) {
+        let Some(s) = &self.store else { return };
+        let matches = s.matches();
+        if matches.is_empty() {
+            return;
+        }
+        let top = self.top_line as u32;
+        self.match_cursor = matches
+            .partition_point(|&line| line < top)
+            .min(matches.len() - 1);
     }
 
     /// 当前检索条件
@@ -147,12 +193,13 @@ impl LogViewApp {
     /// 用给定的词直接发起检索（双击行内文字时调用）。
     ///
     /// 不抢搜索框焦点：连着双击几个词追查线索时，焦点留在日志区更顺手。
+    /// 也不移动视图：人正读到半截，跳回全文件第一个命中等于把人拽走。
     fn search_for(&mut self, word: String) {
         if word.is_empty() {
             return;
         }
         self.query = word;
-        self.run_search();
+        self.run_search(OnSearchDone::StayAtView);
     }
 
     fn handle_drop(&mut self, ctx: &egui::Context) {
@@ -270,17 +317,14 @@ impl eframe::App for LogViewApp {
             s.pump();
         }
 
-        // 搜索结果到位后自动定位到第一个命中
-        if self.pending_first_match && !self.store.as_ref().map(|s| s.searching).unwrap_or(false) {
-            self.pending_first_match = false;
-            self.goto_match(0);
-        }
+        // 搜索结果到位后决定视图去向
+        self.apply_search_outcome();
 
         // 搜索防抖
         if let Some(t) = self.search_dirty {
             if t.elapsed() > Duration::from_millis(250) {
                 self.search_dirty = None;
-                self.run_search();
+                self.run_search(OnSearchDone::GotoFirstMatch);
             }
         }
 
@@ -348,19 +392,19 @@ impl LogViewApp {
                 self.search_dirty = Some(Instant::now());
             }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.run_search();
+                self.run_search(OnSearchDone::GotoFirstMatch);
             }
 
             let cs = ui.checkbox(&mut self.case_sensitive, "区分大小写");
             if cs.changed() {
                 // 选项会改变匹配结果，立刻按新条件重查
-                self.run_search();
+                self.run_search(OnSearchDone::GotoFirstMatch);
             }
             let rx = ui
                 .checkbox(&mut self.use_regex, "正则")
                 .on_hover_text("把检索词当作正则表达式，例如 ERROR|FATAL\\d+");
             if rx.changed() {
-                self.run_search();
+                self.run_search(OnSearchDone::GotoFirstMatch);
             }
             let om = ui.checkbox(&mut self.only_matched, "只显示匹配行");
             if om.changed() {
@@ -398,7 +442,7 @@ impl LogViewApp {
                  g / G — 跳到开头 / 末尾\n\
                  Esc — 清空检索\n\
                  {CMD}O — 打开文件\n\
-                 双击行内文字 — 用该词搜索"
+                 双击行内文字 — 就地搜索该词，视图不移动"
             ));
         });
         ui.add_space(4.0);
@@ -490,13 +534,20 @@ impl LogViewApp {
         }
 
         let row_h = ui.text_style_height(&TextStyle::Monospace) + 3.0;
+        // 一行的实际占位 = 文本高度 + 行间间距。`show_rows` 内部就是这么算行距的，
+        // 行号↔像素的换算必须用同一个数——用差了，偏差会随行号累积：
+        // 30 万行的日志里差几像素就能累积成几万像素，跳转自然落不到目标行上。
+        //
+        // 两个数都取自运行时的字体度量与样式，没有硬编码像素值：各平台加载的中文字体
+        // 不同、屏幕缩放也不同，行高会跟着变，而"实际行距 == row_pitch"这个关系不变。
+        let row_pitch = row_h + ui.spacing().item_spacing.y;
         let gutter_w = (format!("{total}").len() as f32) * 8.0 + 12.0;
 
         // 跳转：换算成滚动偏移
         // pending_jump 存的已经是「列表中的行位置」：
-        // only_matched 模式下是匹配序号，否则是文件行号，两者都直接乘行高。
+        // only_matched 模式下是匹配序号，否则是文件行号，两者都直接乘行距。
         if let Some(target) = self.pending_jump.take() {
-            self.scroll_offset = (target as f32 * row_h - 120.0).max(0.0);
+            self.scroll_offset = (target as f32 * row_pitch - 120.0).max(0.0);
         }
 
         // pending_jump 已在上面取走并转成偏移量，此处只看跟随开关
@@ -524,47 +575,70 @@ impl LogViewApp {
         let out = area.show_rows(ui, row_h, total, |ui, rows| {
             let Some(store) = store_ref else { return };
             for r in rows {
+                let row_top = ui.cursor().top();
                 let line_idx = if only {
                     store.matches().get(r).copied().map(|v| v as usize)
                 } else {
                     Some(r)
                 };
-                let Some(line_idx) = line_idx else { continue };
-                buf.clear();
-                if !store.read_line_into(line_idx, buf) {
-                    continue;
+                // 空行或越界的行也要占位，否则行距会从这里开始错位
+                if let Some(line_idx) = line_idx {
+                    buf.clear();
+                    if store.read_line_into(line_idx, buf) {
+                        if current_line == Some(line_idx) {
+                            // 与命中词的黄色高亮区分开，这里用冷色整行铺底
+                            let bg = if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(30, 44, 62)
+                            } else {
+                                egui::Color32::from_rgb(226, 240, 253)
+                            };
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    egui::vec2(ui.available_width(), row_h),
+                                ),
+                                0.0,
+                                bg,
+                            );
+                        }
+                        ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [gutter_w, row_h],
+                                    egui::Label::new(
+                                        RichText::new(format!("{}", line_idx + 1))
+                                            .monospace()
+                                            .color(ui.visuals().weak_text_color()),
+                                    ),
+                                );
+                                if let Some(word) = render_content(ui, buf, &query, cs, wrap, regex)
+                                {
+                                    search_word = Some(word);
+                                }
+                            });
+                        });
+                    }
                 }
-                if current_line == Some(line_idx) {
-                    // 与命中词的黄色高亮区分开，这里用冷色整行铺底
-                    let bg = if ui.visuals().dark_mode {
-                        egui::Color32::from_rgb(30, 44, 62)
-                    } else {
-                        egui::Color32::from_rgb(226, 240, 253)
-                    };
-                    ui.painter().rect_filled(
-                        egui::Rect::from_min_size(
-                            ui.cursor().min,
-                            egui::vec2(ui.available_width(), row_h),
-                        ),
-                        0.0,
-                        bg,
+                // 上面的容器实际吃掉的高度会比 row_h 多出约 1px（内部布局取整），
+                // 而滚动换算用的是 row_pitch：把光标强制推回 row_top + row_h，
+                // 两者才能对齐，跳转才落在正确的行上。
+                // 开了自动换行时行高本来就随内容变，按固定高度推反而会重叠，故不干预。
+                if !wrap {
+                    ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+                        egui::pos2(ui.min_rect().left(), row_top),
+                        egui::vec2(0.0, row_h),
+                    ));
+                    // 这一条是整套跳转算法的地基：实际行距必须等于换算用的 row_pitch。
+                    // 它一旦不成立（比如 egui 改了光标推进的语义），跳转又会开始偏，
+                    // 而且是"每行差几像素、随行号累积"的隐蔽偏差。
+                    // 所以宁可让 debug 构建与测试直接炸掉，也不让它悄悄退回去。
+                    debug_assert!(
+                        (ui.cursor().top() - row_top - row_pitch).abs() < 0.05,
+                        "实际行距 {} 与换算用的 {} 不一致",
+                        ui.cursor().top() - row_top,
+                        row_pitch
                     );
                 }
-                ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [gutter_w, row_h],
-                            egui::Label::new(
-                                RichText::new(format!("{}", line_idx + 1))
-                                    .monospace()
-                                    .color(ui.visuals().weak_text_color()),
-                            ),
-                        );
-                        if let Some(word) = render_content(ui, buf, &query, cs, wrap, regex) {
-                            search_word = Some(word);
-                        }
-                    });
-                });
             }
         });
 
@@ -575,6 +649,19 @@ impl LogViewApp {
         if !stick {
             self.scroll_offset = out.state.offset.y;
         }
+
+        // 记下视口顶部是哪一行：双击取词后要靠它把游标对齐到当前位置。
+        // 「只显示匹配行」模式下滚动的单位是命中序号，先换算回文件行号。
+        let top_row = (out.state.offset.y / row_pitch).max(0.0) as usize;
+        self.top_line = if only {
+            self.store
+                .as_ref()
+                .and_then(|s| s.matches().get(top_row).copied())
+                .map(|line| line as usize)
+                .unwrap_or(0)
+        } else {
+            top_row
+        };
     }
 }
 
@@ -814,33 +901,24 @@ fn human_size(n: usize) -> String {
     }
 }
 
+/// 测试共用的搭架子代码。
 #[cfg(test)]
-mod shortcut_tests {
+mod test_support {
     use super::*;
 
     /// 造一个带两个命中行的 app。
     ///
     /// `tag` 用于区分文件名：测试是并行执行的，若共用同一个临时文件，
     /// 会互相覆盖内容导致随机失败。
-    fn app_with_hits(tag: &str) -> LogViewApp {
+    pub fn app_with_hits(tag: &str) -> LogViewApp {
         let mut p = std::env::temp_dir();
-        p.push(format!("logview_shortcut_{tag}.log"));
+        p.push(format!("logview_test_{tag}.log"));
         std::fs::write(&p, b"ERROR one\nplain\nERROR two\n").unwrap();
 
         let mut store = LogStore::open(p).unwrap();
-        let wait = |store: &mut LogStore| {
-            for _ in 0..2000 {
-                store.pump();
-                if !store.indexing && !store.searching {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            panic!("后台任务超时");
-        };
-        wait(&mut store);
+        settle(&mut store);
         store.start_search(SearchRequest::new("ERROR", true, false));
-        wait(&mut store);
+        settle(&mut store);
         assert_eq!(store.matches().len(), 2, "前提：应有 2 个命中行");
 
         let mut app = LogViewApp::new();
@@ -848,6 +926,71 @@ mod shortcut_tests {
         app.store = Some(store);
         app
     }
+
+    /// 等后台索引 / 检索结束
+    pub fn settle(store: &mut LogStore) {
+        for _ in 0..2000 {
+            store.pump();
+            if !store.indexing && !store.searching {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("后台任务超时");
+    }
+
+    /// 等 app 当前这一轮检索结束
+    pub fn settle_app(app: &mut LogViewApp) {
+        settle(app.store.as_mut().expect("app 应已打开文件"));
+    }
+
+    /// 造一个较大的 app：`lines` 行，每 101 行放一处「进度」命中，跨满整个文件。
+    ///
+    /// 命中要铺开到全文件，跳转类的问题才会暴露——只在前几行有命中是测不出来的。
+    pub fn big_app(tag: &str, lines: usize) -> LogViewApp {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logview_test_{tag}.log"));
+        let mut data = String::new();
+        for i in 0..lines {
+            if i % 101 == 0 {
+                data.push_str("进度 MARK\n");
+            } else {
+                data.push_str("plain line here\n");
+            }
+        }
+        std::fs::write(&p, data).unwrap();
+
+        let mut app = LogViewApp::new();
+        app.store = Some(LogStore::open(p).unwrap());
+        settle_app(&mut app);
+        app.follow = false;
+        app
+    }
+
+    /// 带真实窗口尺寸的输入。不给屏幕尺寸的话视口是 0，滚动行为与真实运行不一致。
+    pub fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1180.0, 760.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    /// 渲染一帧日志区，返回本帧结束后视口顶部对应的行号
+    pub fn frame(ctx: &egui::Context, app: &mut LogViewApp) -> usize {
+        let _ = ctx.run(raw_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.log_area(ui));
+        });
+        app.top_line
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::test_support::app_with_hits;
+    use super::*;
 
     fn press(
         ctx: &egui::Context,
@@ -930,6 +1073,138 @@ mod defaults {
             !LogViewApp::new().follow,
             "跟随尾部默认为关：否则打开大日志会直接跳到末尾"
         );
+    }
+}
+
+/// 双击取词与在搜索框里输入，对视图的期望不一样：
+/// 前者不该把读到一半的人拽走，后者要跳到第一个命中。
+#[cfg(test)]
+mod search_view_tests {
+    use super::test_support::{app_with_hits, big_app, frame, settle_app};
+    use super::*;
+
+    /// 文件内容固定为三行，ERROR 出现在第 1、3 行（0 起算的 0 和 2）
+    #[test]
+    fn word_search_keeps_the_view_and_aligns_the_cursor() {
+        let mut app = app_with_hits("word_view");
+        app.top_line = 1;
+
+        app.search_for("ERROR".to_string());
+        settle_app(&mut app);
+        app.apply_search_outcome();
+
+        assert!(app.pending_jump.is_none(), "双击取词不该移动视图");
+        assert_eq!(app.match_cursor, 1, "游标应落在视口下方的那个命中上");
+    }
+
+    /// 命中全在视口之上时，游标停在上一个命中，n 不会掉头跳回文件开头
+    #[test]
+    fn word_search_below_all_matches_stays_on_the_last_one() {
+        let mut app = app_with_hits("word_tail");
+        app.top_line = 100_000;
+
+        app.search_for("ERROR".to_string());
+        settle_app(&mut app);
+        app.apply_search_outcome();
+
+        assert!(app.pending_jump.is_none());
+        assert_eq!(app.match_cursor, 1, "应停在最后一个命中，而不是回到第一个");
+    }
+
+    /// 在搜索框里输入仍然要跳到第一个命中，这是原有的行为
+    #[test]
+    fn typed_search_still_jumps_to_the_first_match() {
+        let mut app = app_with_hits("typed");
+        app.match_cursor = 1;
+
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+        app.apply_search_outcome();
+
+        assert_eq!(app.match_cursor, 0);
+        assert_eq!(
+            app.pending_jump,
+            Some(0),
+            "搜索框输入应跳到第一个命中所在行"
+        );
+    }
+
+    /// 视口顶部的行号必须真的跟着滚动走——上面那条"对齐到当前位置"
+    /// 全靠它；它要是一直是 0，双击取词就还是会跳回文件开头。
+    #[test]
+    fn top_line_follows_the_scroll_offset() {
+        let mut app = big_app("topline", 10_000);
+
+        let ctx = egui::Context::default();
+        let at = |app: &mut LogViewApp, offset: f32| {
+            app.scroll_offset = offset;
+            frame(&ctx, app)
+        };
+
+        let a = at(&mut app, 1_000.0);
+        let b = at(&mut app, 4_000.0);
+        assert!(a > 0, "视口顶部行号应随滚动变化，实际为 {a}");
+        assert!(
+            (b as f32) > 3.5 * a as f32 && (b as f32) < 4.5 * a as f32,
+            "偏移翻四倍，行号也应接近翻四倍：a={a} b={b}"
+        );
+    }
+
+    /// 跳到某个命中行之后，那一行必须真的落在可视范围里。
+    ///
+    /// 行号↔像素的换算一旦用错行距，误差会随行号累积：二十万行的日志里
+    /// 一处命中就能差出几万像素。用户看到的就是"按 n 跳过去了，屏幕上却没有那个命中"。
+    #[test]
+    fn jump_lands_the_target_line_inside_the_viewport() {
+        let gap = jump_gap(1.0, "jump_far", true);
+        assert!(gap <= 20, "目标行应落在可视范围内，实际相差 {gap} 行");
+    }
+
+    /// 跳转精度不能依赖屏幕缩放：macOS 的 2x 屏、Linux 的 1.25 / 1.5 分数缩放
+    /// 都在这条里。缩放只改变物理像素，逻辑坐标下的行距关系必须保持一致。
+    #[test]
+    fn jump_lands_the_target_line_at_hidpi_scales() {
+        for ppp in [1.25f32, 1.5, 2.0] {
+            let gap = jump_gap(ppp, &format!("jump_ppp{ppp}"), false);
+            assert!(
+                gap <= 20,
+                "ppp={ppp} 时目标行应落在可视范围内，实际相差 {gap} 行"
+            );
+        }
+    }
+
+    /// 造一个 2 万行的日志，搜到命中后跳到其中一处，返回目标行离视口顶部的行数。
+    ///
+    /// `near_end` 为真时取倒数第三个命中：它贴着文件末尾，会撞上"滚到底"的截断，
+    /// 目标被截在视口偏下的位置——那是正常现象，与行距换算无关。
+    /// 为假时取文件中部的命中；缩放大时测试脚手架的视口高度会虚高，
+    /// 更容易触发截断，所以 HiDPI 用例取中部。
+    fn jump_gap(ppp: f32, tag: &str, near_end: bool) -> usize {
+        let mut app = big_app(tag, 20_000);
+        app.query = "进度".to_string();
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+        app.apply_search_outcome();
+
+        let target = {
+            let s = app.store.as_ref().unwrap();
+            let matches = s.matches();
+            assert!(matches.len() > 100, "前提：应有一批散布全文件的命中");
+            let idx = if near_end {
+                matches.len() - 3
+            } else {
+                matches.len() / 2
+            };
+            matches[idx] as usize
+        };
+
+        app.jump_to_line(target);
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        let top = frame(&ctx, &mut app);
+
+        assert!(top <= target, "ppp={ppp} 时跳转不该越过目标行");
+        target - top
     }
 }
 
