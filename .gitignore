@@ -13,6 +13,9 @@
 *.swp
 *.swo
 
+# 本地工作记录（记忆、临时笔记）
+.workbuddy/
+
 # macOS
 .DS_Store
 
