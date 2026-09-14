@@ -29,6 +29,8 @@ pub struct LogViewApp {
     /// 正则模式下用于行内高亮的已编译表达式（编译失败时为 None）
     highlight_regex: Option<regex::Regex>,
     only_matched: bool,
+    /// 跟随尾部（等价 tail -f）。默认关闭：打开日志先停在开头，
+    /// 需要盯实时输出时再勾上。
     follow: bool,
     wrap: bool,
     dark: Option<bool>,
@@ -65,7 +67,7 @@ impl Default for LogViewApp {
             use_regex: false,
             highlight_regex: None,
             only_matched: false,
-            follow: true,
+            follow: false,
             wrap: false,
             dark: None,
             error: None,
@@ -289,7 +291,7 @@ impl eframe::App for LogViewApp {
         // 快捷键放在各面板之后：此时 search_has_focus 已是本帧的最新状态
         self.handle_shortcuts(ctx);
 
-        // 保持 tail 跟随与索引进度的刷新
+        // 定时重绘：索引进度、文件变化检测与跟随刷新都依赖它
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
@@ -914,6 +916,20 @@ mod shortcut_tests {
 
         press(&ctx, &mut app, egui::Key::Slash, egui::Modifiers::NONE);
         assert!(app.focus_search, "/ 应请求聚焦搜索框");
+    }
+}
+
+#[cfg(test)]
+mod defaults {
+    use super::*;
+
+    /// 打开日志先停在开头看起，需要盯实时输出时再手动勾上「跟随尾部」。
+    #[test]
+    fn follow_is_off_by_default() {
+        assert!(
+            !LogViewApp::new().follow,
+            "跟随尾部默认为关：否则打开大日志会直接跳到末尾"
+        );
     }
 }
 
