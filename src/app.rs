@@ -481,8 +481,14 @@ impl LogViewApp {
                 ui.separator();
                 let n = s.matches().len();
                 if s.search_truncated() {
+                    // 扫描是完整的，总数准确；只是可跳转的命中被保留上限截断了
+                    let reach = s
+                        .matches()
+                        .last()
+                        .map(|line| *line as usize + 1)
+                        .unwrap_or(0);
                     ui.label(
-                        RichText::new(format!("{n}+ 匹配（已达上限，结果不完整）"))
+                        RichText::new(truncated_hits_label(n, reach, s.search_total()))
                             .color(ui.visuals().warn_fg_color),
                     );
                 } else {
@@ -887,6 +893,15 @@ fn floor_char_boundary(s: &str, max: usize) -> &str {
     &s[..i]
 }
 
+/// 命中数被保留上限截断时的状态栏文案。
+///
+/// 三个数字各回答一个问题：能跳转多少行、这些覆盖到第几行、全文一共多少处命中。
+/// 关键在「到第几行」——它让用户知道文件后面那段到底有没有命中，
+/// 而不是含糊的一句"结果不完整"，看完仍不知道是没命中还是没搜。
+fn truncated_hits_label(navigable_lines: usize, reach_line: usize, total_hits: usize) -> String {
+    format!("可跳转前 {navigable_lines} 行（到第 {reach_line} 行）；全文共 {total_hits} 处命中")
+}
+
 fn human_size(n: usize) -> String {
     const KB: f64 = 1024.0;
     let n = n as f64;
@@ -1072,6 +1087,20 @@ mod defaults {
         assert!(
             !LogViewApp::new().follow,
             "跟随尾部默认为关：否则打开大日志会直接跳到末尾"
+        );
+    }
+}
+
+/// 命中数被保留上限截断时，状态栏要把"能跳到哪、覆盖到哪、一共多少"说清楚
+#[cfg(test)]
+mod status_label_tests {
+    use super::*;
+
+    #[test]
+    fn truncated_label_reports_reach_and_total() {
+        assert_eq!(
+            truncated_hits_label(50_000, 50_000, 296_899),
+            "可跳转前 50000 行（到第 50000 行）；全文共 296899 处命中"
         );
     }
 }

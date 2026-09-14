@@ -115,6 +115,28 @@ fn search_deduplicates_multiple_hits_per_line() {
     s.start_search(SearchRequest::new("error", true, false));
     settle(&mut s, Duration::from_secs(5));
     assert_eq!(s.matches(), &[0], "同一行多次命中只应出现一次");
+    assert_eq!(s.search_total(), 3, "总数按出现次数算，不按行数");
+}
+
+/// 一行里出现多次的词，可跳转额度按**行**计，不该按出现次数计。
+///
+/// 这是实测踩到的场景：每行 3 处的检索，按出现次数扣额度时只覆盖到 1/3 的行数就撞上限，
+/// 状态栏于是显示"可跳转前 1.67 万行"，而文件有 29.7 万行。按行计之后同样的文件应当全部可跳。
+#[test]
+fn dense_matches_are_navigable_line_by_line() {
+    let lines = 30_000;
+    let mut data = Vec::new();
+    for i in 0..lines {
+        data.extend_from_slice(format!("e e e row {i}\n").as_bytes());
+    }
+    let mut s = open(&data, "dense.log");
+
+    s.start_search(SearchRequest::new("e", true, false));
+    settle(&mut s, Duration::from_secs(30));
+
+    assert_eq!(s.matches().len(), lines, "每个命中行都应可跳转");
+    assert!(!s.search_truncated(), "按行计额度，这种密度不该撞上限");
+    assert_eq!(s.search_total(), lines * 3, "总数仍按出现次数统计");
 }
 
 #[test]

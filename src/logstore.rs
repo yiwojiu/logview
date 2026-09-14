@@ -8,8 +8,15 @@ use std::sync::Arc;
 
 /// 索引线程每次回传的行数
 const INDEX_CHUNK: usize = 20_000;
-/// 搜索最多保留的命中数，防止超高频词把内存打爆
-pub const MAX_SEARCH_HITS: usize = 50_000;
+/// 最多保留多少个**命中行**的位置（可跳转的上限）。
+///
+/// 单位是"行"而不是"命中次数"：跳转的单位本来就是行，一行里同一个词出现三次
+/// 记三份位置没有一点用，却会让内存随出现次数膨胀——正是这一点让常见词只覆盖到
+/// 文件前一小段。按行记之后每命中行只要 8 字节（暂存）+ 4 字节（常驻）：
+/// 49 MB / 29.7 万行的日志，最狠的单字母检索也只占 2.3 MB + 1.1 MB。
+///
+/// 超出的部分照常统计总数，只是无法跳转（`search_truncated` 会报出来）。
+pub const MAX_NAVIGABLE_LINES: usize = 1_000_000;
 
 pub enum IndexMsg {
     /// 一批行起始偏移
@@ -18,9 +25,45 @@ pub enum IndexMsg {
     Done(usize),
 }
 
+/// 一次检索的原始结果。
+///
+/// `positions` 每组命中行只保留第一处的位置（用于跳转），最多 [`MAX_NAVIGABLE_LINES`] 行；
+/// `total` 是全文件的命中总数（子串检索按出现次数算，正则检索按命中行数算），用于如实报数。
+///
+/// 注意 `total` 与 `positions.len()` 不是一回事：一行里出现三次，总数算三、位置只留一份。
+/// 所以"有没有被截断"不能靠两者比大小，要单独记（`dropped`）。
+#[derive(Default)]
+pub struct SearchHits {
+    positions: Vec<usize>,
+    total: usize,
+    dropped: bool,
+}
+
+impl SearchHits {
+    /// 记一个命中行：总数累加，位置在未达上限时保留
+    fn push(&mut self, pos: usize) {
+        self.total += 1;
+        if self.positions.len() < MAX_NAVIGABLE_LINES {
+            self.positions.push(pos);
+        } else {
+            self.dropped = true;
+        }
+    }
+
+    /// 同一行里除第一处之外的命中：只计数，不留位置
+    fn count_only(&mut self) {
+        self.total += 1;
+    }
+
+    /// 是否有命中行因为上限而没能保留
+    fn truncated(&self) -> bool {
+        self.dropped
+    }
+}
+
 pub enum SearchMsg {
-    /// 命中的行起始偏移（升序）
-    Hits(Vec<usize>),
+    /// 命中位置（升序，可能被上限截断）与全文件命中总数
+    Hits(SearchHits),
     /// 正则表达式编译失败
     RegexError(String),
 }
@@ -67,8 +110,10 @@ pub struct LogStore {
     pub searching: bool,
     /// 上一次搜索命中的行号（升序、去重）
     matches: Vec<u32>,
-    /// 命中数是否达到上限而被截断
+    /// 命中数是否撞上保留上限（此时可跳转的命中不完整，但总数是准的）
     search_truncated: bool,
+    /// 上一次检索的全文件命中总数，不受保留上限影响
+    search_total: usize,
     /// 索引尚未建完时挂起的检索条件，索引完成后自动执行
     pending_search: Option<SearchRequest>,
     /// 上一次正则检索的编译错误
@@ -102,6 +147,7 @@ impl LogStore {
             searching: false,
             matches: Vec::new(),
             search_truncated: false,
+            search_total: 0,
             pending_search: None,
             regex_error: None,
         })
@@ -211,6 +257,7 @@ impl LogStore {
             self.scanned = 0;
             self.matches.clear();
             self.search_truncated = false;
+            self.search_total = 0;
             self.pending_search = None;
             if self.remap(file).is_ok() {
                 self.spawn_index(0);
@@ -317,28 +364,34 @@ impl LogStore {
         self.searching = false;
         self.search_rx = None;
         self.search_truncated = false;
+        self.search_total = 0;
         self.pending_search = None;
         self.regex_error = None;
     }
 
-    /// 命中数是否撞上上限（此时显示的数字是不完整的）
+    /// 是否有命中因为保留上限而无法跳转（总数仍然准确）
     pub fn search_truncated(&self) -> bool {
         self.search_truncated
     }
 
-    fn apply_hits(&mut self, hits: Vec<usize>) {
-        self.search_truncated = hits.len() >= MAX_SEARCH_HITS;
+    /// 上一次检索的全文件命中总数。子串检索按出现次数算，正则检索按命中行数算。
+    pub fn search_total(&self) -> usize {
+        self.search_total
+    }
+
+    fn apply_hits(&mut self, hits: SearchHits) {
+        self.search_truncated = hits.truncated();
+        self.search_total = hits.total;
         self.matches.clear();
-        let mut last: Option<usize> = None;
-        for pos in hits {
-            let idx = match self.line_starts.binary_search(&pos) {
-                Ok(i) => i,
-                Err(0) => 0,
-                Err(i) => i - 1,
-            };
-            if Some(idx) != last {
-                self.matches.push(idx as u32);
-                last = Some(idx);
+        // 位置与行起始都是升序，一次线性归并就够，不必对每个位置二分：
+        // 上限提到百万行之后，逐位二分会成为检索完成后的主要开销。
+        let mut line = 0usize;
+        for pos in hits.positions {
+            while line + 1 < self.line_starts.len() && self.line_starts[line + 1] <= pos {
+                line += 1;
+            }
+            if self.matches.last() != Some(&(line as u32)) {
+                self.matches.push(line as u32);
             }
         }
     }
@@ -386,22 +439,27 @@ fn scan_lines(mmap: Arc<Mmap>, start: usize, limit: usize, tx: Sender<IndexMsg>)
     let _ = tx.send(IndexMsg::Done(i));
 }
 
-fn search_bytes(mmap: &[u8], limit: usize, pattern: &[u8]) -> Vec<usize> {
+fn search_bytes(mmap: &[u8], limit: usize, pattern: &[u8]) -> SearchHits {
     let finder = memchr::memmem::Finder::new(pattern);
-    let mut hits = Vec::new();
+    let mut hits = SearchHits::default();
+    let mut previous: Option<usize> = None;
     for pos in finder.find_iter(&mmap[..limit]) {
-        hits.push(pos);
-        if hits.len() >= MAX_SEARCH_HITS {
-            break;
+        // 与上一处命中之间没有换行，说明还在同一行：只计数，不再留位置
+        let same_line = previous.is_some_and(|p| memchr::memchr(b'\n', &mmap[p..pos]).is_none());
+        if same_line {
+            hits.count_only();
+        } else {
+            hits.push(pos);
         }
+        previous = Some(pos);
     }
     hits
 }
 
-fn search_bytes_ci(mmap: &[u8], limit: usize, pattern: &[u8]) -> Vec<usize> {
+fn search_bytes_ci(mmap: &[u8], limit: usize, pattern: &[u8]) -> SearchHits {
     let needle = pattern.to_ascii_lowercase();
     let finder = memchr::memmem::Finder::new(&needle);
-    let mut hits = Vec::new();
+    let mut hits = SearchHits::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut i = 0usize;
     while i < limit {
@@ -412,10 +470,13 @@ fn search_bytes_ci(mmap: &[u8], limit: usize, pattern: &[u8]) -> Vec<usize> {
         buf.clear();
         buf.extend_from_slice(&mmap[i..end]);
         buf.make_ascii_lowercase();
+        let mut first_in_line = true;
         for m in finder.find_iter(&buf) {
-            hits.push(i + m);
-            if hits.len() >= MAX_SEARCH_HITS {
-                return hits;
+            if first_in_line {
+                hits.push(i + m);
+                first_in_line = false;
+            } else {
+                hits.count_only();
             }
         }
         i = end + 1;
@@ -433,8 +494,8 @@ fn search_regex(
     limit: usize,
     re: &regex::Regex,
     encoding: &'static Encoding,
-) -> Vec<usize> {
-    let mut hits = Vec::new();
+) -> SearchHits {
+    let mut hits = SearchHits::default();
     let mut line = String::with_capacity(256);
     let mut i = 0usize;
     while i < limit {
@@ -446,9 +507,6 @@ fn search_regex(
         decode_into(trim_eol(&mmap[i..end]), encoding, &mut line);
         if re.is_match(&line) {
             hits.push(i);
-            if hits.len() >= MAX_SEARCH_HITS {
-                break;
-            }
         }
         i = end + 1;
     }
@@ -490,5 +548,27 @@ pub fn encoding_name(e: &'static Encoding) -> &'static str {
         "UTF-8"
     } else {
         "GB18030"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 上限的算术：位置留到上限为止，总数继续累加；正好到上限不算截断。
+    #[test]
+    fn hits_beyond_the_cap_keep_counting() {
+        let mut hits = SearchHits::default();
+        for i in 0..MAX_NAVIGABLE_LINES {
+            hits.push(i);
+        }
+        assert_eq!(hits.positions.len(), MAX_NAVIGABLE_LINES);
+        assert!(!hits.truncated(), "正好到上限时不该算截断");
+
+        hits.push(MAX_NAVIGABLE_LINES);
+        hits.count_only();
+        assert_eq!(hits.positions.len(), MAX_NAVIGABLE_LINES, "位置不再增长");
+        assert_eq!(hits.total, MAX_NAVIGABLE_LINES + 2, "总数照常累加");
+        assert!(hits.truncated(), "超出上限后应报截断");
     }
 }
