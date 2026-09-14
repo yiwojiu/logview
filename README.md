@@ -101,6 +101,10 @@
 | `logview-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
 | `logview-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
 
+macOS 的压缩包解压后是 `logview.app`，**双击即可运行**——不是裸二进制，
+所以不会弹出终端窗口。若想在终端里使用，执行
+`logview.app/Contents/MacOS/logview`。
+
 发布页附带 `SHA256SUMS.txt`，可用于校验文件完整性：
 
 ```bash
@@ -108,8 +112,9 @@ shasum -a 256 -c SHA256SUMS.txt        # macOS
 sha256sum -c SHA256SUMS.txt            # Linux
 ```
 
-> macOS 产物未做代码签名。首次打开需在 Finder 中右键选择「打开」，
-> 或先执行 `xattr -d com.apple.quarantine logview`。
+> macOS 产物只做了 ad-hoc 签名，没有 Apple 开发者签名和公证。首次打开需在
+> Finder 中右键选择「打开」；若系统提示应用已损坏，执行
+> `xattr -cr logview.app` 之后再打开。
 
 ### 从源码构建
 

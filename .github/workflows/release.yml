@@ -55,8 +55,30 @@ jobs:
       - name: 构建
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: 打包（Linux / macOS）
+      - name: 读取版本号
         if: runner.os != 'Windows'
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+      # macOS 必须打成 .app：Finder 遇到裸二进制会交给终端执行，
+      # 双击就会弹出一个终端窗口，而 Windows 靠 PE 头部标记解决这个问题
+      - name: 打包（macOS，包成 .app）
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bash assets/make-app.sh \
+            "target/${{ matrix.target }}/release/logview" \
+            "." \
+            "${{ steps.ver.outputs.value }}"
+          tar -czf logview-${{ matrix.target }}.tar.gz logview.app
+          echo "产物大小：$(du -h logview-${{ matrix.target }}.tar.gz | cut -f1)"
+
+      - name: 打包（Linux）
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           tar -czf logview-${{ matrix.target }}.tar.gz \
