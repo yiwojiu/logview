@@ -119,6 +119,17 @@ cargo build --release
 
 产物位于 `target/release/logview`，Windows 下为 `logview.exe`。
 
+Windows 的 exe 文件图标由 `build.rs` 处理：它把 `assets/icon.rc` 编译成 PE 资源再交给链接器。
+资源编译器 `rc.exe` 依次从 `RC` 环境变量、Windows SDK 安装目录、`PATH` 中查找；三者都没有时
+只打印一条警告并跳过，不会中断构建，产物退化为系统默认图标。其他平台不需要这一步。
+
+> 运行时窗口与任务栏的图标走的是另一条路径（`ViewportBuilder::with_icon` + `assets/icon-128.rgba`），
+> 两者互不替代：只有后者时，窗口内看起来正常，但资源管理器里的 exe 仍是系统默认图标。
+
+Windows 的 release 构建切换为图形子系统（`#![windows_subsystem = "windows"]`），双击运行不再附带
+控制台窗口。代价是进程没有 stderr：为此 release 构建会把 panic 内容弹成对话框，避免再次出现
+「窗口一闪就没了」却查不到原因的情况。debug 构建保留控制台，`cargo run` 时照旧直接看终端输出。
+
 ## 使用方法
 
 ```bash
@@ -176,7 +187,9 @@ Windows 与 Linux 上 `⌘` 对应 `Ctrl`。
 | `src/logstore.rs` | 内存映射、行偏移索引、增量索引线程、文件变更检测、编码判定与按行解码、后台检索 |
 | `src/app.rs` | egui 界面：虚拟滚动列表、检索高亮、级别着色、工具栏与状态栏 |
 | `src/fonts.rs` | 按平台探测并加载系统 CJK 字体 |
-| `src/main.rs` | 程序入口与命令行参数处理 |
+| `src/main.rs` | 程序入口、命令行参数、release 下的图形子系统与 panic 对话框 |
+| `build.rs` | 构建脚本：Windows 下把 `assets/icon.rc` 编译成 PE 资源链接进 exe |
+| `assets/` | 图标素材；`icon.ico` 供资源编译，`icon-128.rgba` 供运行时窗口图标 |
 | `tests/store_test.rs` | 集成测试，覆盖编码判定、索引、检索、文件增长与轮转 |
 | `examples/bench.rs` | 大文件压力测试，输出打开 / 索引 / 检索耗时 |
 | `examples/fontcheck.rs` | 中文字体加载自检 |
@@ -218,6 +231,9 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 产物位于 `target/<target>/release/`。
+
+交叉编译到 Windows 的 GNU 目标（`x86_64-pc-windows-gnu`）**不会**嵌入 exe 图标：
+PE 资源是通过 MSVC 链接器认识的 `.res` 送入的，这条路径只覆盖 MSVC 目标。
 
 ## 发布流程
 

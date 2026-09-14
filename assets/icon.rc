@@ -1,0 +1,7 @@
+// exe 的文件图标。资源管理器（以及「属性 → 更改图标」）读的是 PE 里的
+// RT_GROUP_ICON / RT_ICON 两节资源，和运行时用 ViewportBuilder::with_icon
+// 设的窗口图标是两回事，缺了这份，exe 就是系统默认图标。
+//
+// 路径相对包根目录：build.rs 会把 rc.exe 的工作目录锚到那里。
+// ID 用 1，这是 Windows 取「主图标」的惯例。
+1 ICON "assets\\icon.ico"
