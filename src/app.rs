@@ -1,6 +1,7 @@
 use crate::logstore::{encoding_name, LogStore, SearchRequest};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextStyle};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -341,47 +342,73 @@ impl eframe::App for LogViewApp {
 }
 
 impl LogViewApp {
+    /// 工具栏分两层：第一层管"看什么文件、怎么显示"，第二层管"搜什么、跳到哪"。
+    ///
+    /// 原先两层是混在一起的：打开文件、主题、六个复选框、导航按钮全铺在同一行，
+    /// 每个控件权重一样，找东西得逐个读文字。现在按用途归位，
+    /// 并且把「打开文件」做成整屏唯一的主按钮——它是打开软件后第一个要点的东西。
     fn toolbar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("打开文件").clicked() {
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            let open = egui::Button::new(RichText::new("打开文件").color(Color32::WHITE))
+                .fill(hex(PRIMARY_FILL));
+            if ui.add(open).clicked() {
                 if let Some(p) = rfd::FileDialog::new().pick_file() {
                     self.open_path(p);
                 }
             }
 
-            if let Some(s) = &self.store {
-                ui.label(
-                    RichText::new(s.path_str())
-                        .monospace()
-                        .color(ui.visuals().weak_text_color()),
-                );
-            } else {
-                ui.label(
-                    RichText::new("未打开文件 — 点按钮选择，或把日志文件拖进窗口")
-                        .color(ui.visuals().weak_text_color()),
-                );
+            match &self.store {
+                Some(s) => {
+                    let name = s.path_str();
+                    // 宽度按窗口比例给上限：宽窗口多显示一点路径，窄窗口不把右侧视图开关挤掉。
+                    // 用 allocate_ui_with_layout 而不是 add_sized——后者会把 label 居中在格子里，
+                    // 文件名就飘到离按钮很远的地方去了。
+                    let w = (ui.available_width() * 0.32).clamp(80.0, 360.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width(w);
+                        // 不要在这里加 on_hover_text：`Label` 在文本被 elide 时会**自己**
+                        // 挂一个"完整文本"的悬停提示（label.rs 里 `if galley.elided`），
+                        // 再加一个就会并排弹出两个内容相同的提示框。
+                        // 而且它自带的只在真的被截断时才出现，比无条件提示更合适。
+                        let _ = ui.add(egui::Label::new(RichText::new(&name)).truncate());
+                    });
+                }
+                None => {
+                    ui.label(
+                        RichText::new("未打开文件 — 点按钮选择，或把日志文件拖进窗口")
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
             }
 
-            ui.separator();
-            let dark_label = match self.dark {
-                Some(true) => "浅色",
-                Some(false) => "深色",
-                None => "主题",
-            };
-            if ui.button(dark_label).clicked() {
-                let now_dark = self.dark.unwrap_or_else(|| ui.visuals().dark_mode);
-                self.dark = Some(!now_dark);
-            }
+            // 视图开关靠右。right_to_left 里先加的排在更右边，所以这里是视觉上的倒序。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.theme_button(ui);
+                ui.checkbox(&mut self.wrap, "自动换行")
+                    .on_hover_text("长行折行显示；开启后跳转定位不再精确");
+                ui.checkbox(&mut self.follow, "跟随尾部")
+                    .on_hover_text("类似 tail -f，自动滚到最新一行");
+                if ui
+                    .checkbox(&mut self.only_matched, "只显示匹配行")
+                    .changed()
+                {
+                    self.scroll_offset = 0.0;
+                    self.pending_jump = Some(0);
+                }
+            });
         });
 
-        ui.add_space(2.0);
-        ui.horizontal_wrapped(|ui| {
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let search_w = (ui.available_width() * 0.34).clamp(180.0, 460.0);
             let resp = ui.add(
                 TextEdit::singleline(&mut self.query)
                     .id(egui::Id::new(SEARCH_ID))
                     .hint_text(format!("搜索（{CMD}F 或 / 聚焦，n / N 跳转）"))
-                    .desired_width(320.0),
+                    .desired_width(search_w),
             );
             if self.focus_search {
                 resp.request_focus();
@@ -406,47 +433,57 @@ impl LogViewApp {
             if rx.changed() {
                 self.run_search(OnSearchDone::GotoFirstMatch);
             }
-            let om = ui.checkbox(&mut self.only_matched, "只显示匹配行");
-            if om.changed() {
-                self.scroll_offset = 0.0;
-                self.pending_jump = Some(0);
-            }
-            ui.checkbox(&mut self.follow, "跟随尾部")
-                .on_hover_text("类似 tail -f，自动滚到最新一行");
-            ui.checkbox(&mut self.wrap, "自动换行");
 
-            let matches = self.store.as_ref().map(|s| s.matches().len()).unwrap_or(0);
-            ui.separator();
-            if ui.button("◀").clicked() {
-                self.goto_match(-1);
-            }
-            if ui.button("▶").clicked() {
-                self.goto_match(1);
-            }
-            if self.query.is_empty() {
-                ui.label(RichText::new("").weak());
-            } else {
-                ui.label(format!("{}/{}", self.match_cursor + 1, matches.max(1)));
-            }
-            if ui.button("清空").clicked() {
-                self.query.clear();
-                if let Some(s) = &mut self.store {
-                    s.clear_search();
+            // 命中导航靠右；没有检索词时不占位置——空着比显示一个 0/0 干净
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let _ = ui.button("?").on_hover_text(format!(
+                    "快捷键\n\
+                     {CMD}F 或 / — 聚焦搜索框\n\
+                     n / N — 下 / 上一个命中\n\
+                     g / G — 跳到开头 / 末尾\n\
+                     Esc — 清空检索\n\
+                     {CMD}O — 打开文件\n\
+                     双击行内文字 — 就地搜索该词，视图不移动"
+                ));
+                if !self.query.is_empty() {
+                    if ui.button("清空").clicked() {
+                        self.query.clear();
+                        if let Some(s) = &mut self.store {
+                            s.clear_search();
+                        }
+                    }
+                    let matches = self.store.as_ref().map(|s| s.matches().len()).unwrap_or(0);
+                    ui.label(
+                        RichText::new(format!("{} / {}", self.match_cursor + 1, matches))
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                    if ui.button("▶").clicked() {
+                        self.goto_match(1);
+                    }
+                    if ui.button("◀").clicked() {
+                        self.goto_match(-1);
+                    }
                 }
-            }
-
-            let _ = ui.button("?").on_hover_text(format!(
-                "快捷键\n\
-                 {CMD}F 或 / — 聚焦搜索框\n\
-                 n / N — 下 / 上一个命中\n\
-                 g / G — 跳到开头 / 末尾\n\
-                 Esc — 清空检索\n\
-                 {CMD}O — 打开文件\n\
-                 双击行内文字 — 就地搜索该词，视图不移动"
-            ));
+            });
         });
-        ui.add_space(4.0);
+
+        ui.add_space(6.0);
         let _ = ctx;
+    }
+
+    /// 主题按钮：图标表示**当前**状态，悬停说明点击后变成什么。
+    ///
+    /// 原先按钮上写的是"点击后会变成"的状态（当前跟随系统时显示「主题」），
+    /// 既不像状态也不像动作，看着不知道是什么意思。
+    fn theme_button(&mut self, ui: &mut egui::Ui) {
+        let (icon, tip) = match self.dark {
+            None => ('◑', "跟随系统（点击改为浅色）"),
+            Some(false) => ('☀', "浅色（点击改为深色）"),
+            Some(true) => ('🌙', "深色（点击改为跟随系统）"),
+        };
+        if ui.button(icon.to_string()).on_hover_text(tip).clicked() {
+            self.dark = next_theme(self.dark);
+        }
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
@@ -591,6 +628,8 @@ impl LogViewApp {
                 if let Some(line_idx) = line_idx {
                     buf.clear();
                     if store.read_line_into(line_idx, buf) {
+                        // 行首结构只解析一次：色条与行内上色共用同一份结果
+                        let head = parse_line_head(buf);
                         if current_line == Some(line_idx) {
                             // 与命中词的黄色高亮区分开，这里用冷色整行铺底
                             let bg = if ui.visuals().dark_mode {
@@ -607,8 +646,27 @@ impl LogViewApp {
                                 bg,
                             );
                         }
+                        let rule_color = head
+                            .level_of()
+                            .and_then(|lv| lv.style(ui.visuals().dark_mode).rule);
                         ui.allocate_ui(egui::vec2(ui.available_width(), row_h), |ui| {
                             ui.horizontal(|ui| {
+                                // 级别色条。无论这一行有没有识别出级别，都要占住同样的
+                                // 宽度，否则内容列会随首行是否带级别而左右跳动。
+                                let (cell, _) = ui.allocate_exact_size(
+                                    egui::vec2(LEVEL_RULE_W + LEVEL_RULE_GAP, row_h),
+                                    egui::Sense::hover(),
+                                );
+                                if let Some(c) = rule_color {
+                                    ui.painter().rect_filled(
+                                        egui::Rect::from_min_size(
+                                            cell.min,
+                                            egui::vec2(LEVEL_RULE_W, row_h),
+                                        ),
+                                        0.0,
+                                        c,
+                                    );
+                                }
                                 ui.add_sized(
                                     [gutter_w, row_h],
                                     egui::Label::new(
@@ -617,7 +675,8 @@ impl LogViewApp {
                                             .color(ui.visuals().weak_text_color()),
                                     ),
                                 );
-                                if let Some(word) = render_content(ui, buf, &query, cs, wrap, regex)
+                                if let Some(word) =
+                                    render_content(ui, buf, &head, &query, cs, wrap, regex)
                                 {
                                     search_word = Some(word);
                                 }
@@ -671,6 +730,252 @@ impl LogViewApp {
     }
 }
 
+/// 「打开文件」按钮的填充色。
+///
+/// 用固定值而不是 `visuals.selection.bg_fill`：那个值在两个主题下的深浅方向是相反的
+/// （浅色主题给浅蓝 `#90D1FF`，白字只有 1.65:1，根本读不出；深色主题给深青蓝 `#005C80`，
+/// 白字够亮但相对背景只有 2.33:1）。这跟"不要在主题色上做乘法"是同一类错误——
+/// 依赖派生色，就要为每种主题各验一遍；用指定值只需验一个。
+/// `#2563EB` 在两种主题下都达标：白字 5.17:1，相对背景浅色 4.87:1 / 深色 3.33:1。
+const PRIMARY_FILL: u32 = 0x2563EB;
+
+/// 行左侧级别色条的宽度
+const LEVEL_RULE_W: f32 = 3.0;
+/// 级别色条与行号之间的间距，色条有无都要占住这段宽度，内容列才会对齐
+const LEVEL_RULE_GAP: f32 = 5.0;
+/// 查找日志级别时最多跳过几个 token。
+///
+/// 定这个上限是为了修掉一个误判：原先的判据是"整行包含 ERROR 就给整行染色"，
+/// 于是正文里提到 ERROR（比如"检测到 3 个 ERROR 已忽略"）也会被当成错误行。
+/// 现在只认时间戳之后的头几个 token——`[main]`、`[order-1]` 这类中间字段会各算一个，
+/// 3 个够覆盖 `时间 [线程] 级别` 之类排布，同时正文里的 ERROR 再也够不着。
+const LEVEL_MAX_TOKENS: usize = 3;
+
+/// 日志级别。只用来给行首那个级别单词上色、以及决定左侧色条。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+/// 级别在界面上用到的颜色。
+///
+/// `bg` / `rule` 是 `Option`：只有 WARN 与 ERROR 才带底色和左侧色条。
+/// INFO 与 DEBUG 在日志里占绝大多数，若每行都挂色条，左边会连成一条满屏的线，
+/// 色条也就失去了"让异常跳出来"的作用——全都强调等于都不强调。
+struct LevelStyle {
+    /// 标签底色，None 表示不给底色
+    bg: Option<Color32>,
+    /// 标签文字色
+    fg: Color32,
+    /// 行左侧色条，None 表示这一行不画
+    rule: Option<Color32>,
+}
+
+/// `0xRRGGBB` → Color32，便于把配色写成一张表
+fn hex(v: u32) -> Color32 {
+    Color32::from_rgb((v >> 16) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+}
+
+impl Level {
+    /// 级别词的候选写法。更严重的排在前面；较长的写法必须排在较短的之前，
+    /// 否则 `WARNING` 会被 `WARN` 抢先匹配掉半截。
+    const WORDS: [(&'static str, Level); 10] = [
+        ("CRITICAL", Level::Error),
+        ("FATAL", Level::Error),
+        ("SEVERE", Level::Error),
+        ("ERROR", Level::Error),
+        ("WARNING", Level::Warn),
+        ("WARN", Level::Warn),
+        ("NOTICE", Level::Info),
+        ("INFO", Level::Info),
+        ("DEBUG", Level::Debug),
+        ("TRACE", Level::Debug),
+    ];
+
+    /// WARN / ERROR 用底色加色条突出；INFO / DEBUG 只调文字色，不加任何色块。
+    /// 亮色主题用 50 级做底、800 级做字；暗色主题用 900 级做底、100 级做字。
+    /// 色条在两个主题里共用同一组中间色——滚动时它才是稳定的视觉锚点。
+    fn style(self, dark: bool) -> LevelStyle {
+        match (self, dark) {
+            (Level::Error, false) => LevelStyle {
+                bg: Some(hex(0xFCEBEB)),
+                fg: hex(0x791F1F),
+                rule: Some(hex(0xE24B4A)),
+            },
+            (Level::Error, true) => LevelStyle {
+                bg: Some(hex(0x501313)),
+                fg: hex(0xF7C1C1),
+                rule: Some(hex(0xE24B4A)),
+            },
+            (Level::Warn, false) => LevelStyle {
+                bg: Some(hex(0xFAEEDA)),
+                fg: hex(0x633806),
+                rule: Some(hex(0xEF9F27)),
+            },
+            (Level::Warn, true) => LevelStyle {
+                bg: Some(hex(0x412402)),
+                fg: hex(0xFAC775),
+                rule: Some(hex(0xEF9F27)),
+            },
+            (Level::Info, false) => LevelStyle {
+                bg: None,
+                fg: hex(0x145ABE),
+                rule: None,
+            },
+            (Level::Info, true) => LevelStyle {
+                bg: None,
+                fg: hex(0x78BEFF),
+                rule: None,
+            },
+            (Level::Debug, false) | (Level::Debug, true) => LevelStyle {
+                bg: None,
+                fg: muted_text(dark),
+                rule: None,
+            },
+        }
+    }
+}
+
+/// 时间戳这类"次要但必须读得清"的文字色。
+///
+/// 这里给**指定值**，而不是拿 `weak_text_color()` 再压暗。
+/// 原先的做法是 `weak_text_color().linear_multiply(0.62)`，浅色主题下对比度掉到 3:1
+/// 以下——老许直接反馈"看不清"。次要文字可以弱，但不能弱到读不动，
+/// 所以两边都取到 WCAG AA（4.5:1）以上：亮色 #5F5E5A ≈ 6.2:1，暗色 #B4B2A9 ≈ 8.0:1。
+fn muted_text(dark: bool) -> Color32 {
+    if dark {
+        hex(0xB4B2A9)
+    } else {
+        hex(0x5F5E5A)
+    }
+}
+
+/// 行首能识别出来的结构（都按字节记范围，因为日期/时间/级别全是 ASCII）。
+///
+/// 日期与时间分开记，是为了把日期淡出：同一天的日志里日期是冗余的，
+/// 真正在变的是时间，让它醒目一点更有用。
+#[derive(Default, PartialEq, Eq, Debug)]
+struct LineHead {
+    /// 日期部分，如 `2026-09-11`
+    date: Option<Range<usize>>,
+    /// 时间部分（含小数秒），如 `14:33:41.561`
+    time: Option<Range<usize>>,
+    /// 级别单词及其级别
+    level: Option<(Range<usize>, Level)>,
+}
+
+impl LineHead {
+    fn level_of(&self) -> Option<Level> {
+        self.level.as_ref().map(|(_, lv)| *lv)
+    }
+}
+
+/// 扫描 `YYYY-MM-DD HH:MM:SS[.fff]`（也接受 `/` 作日期分隔、`T` 作日期时间分隔、
+/// `,` 作小数分隔——Java 的某些 Locale 会用逗号）。
+///
+/// 返回 `(日期结束位置, 整段结束位置)`。只认 ASCII 数字与固定分隔符，按字节扫描是安全的。
+fn scan_timestamp(b: &[u8], start: usize) -> Option<(usize, usize)> {
+    if b.len() < start + 10 {
+        return None;
+    }
+    let sep = b[start + 4];
+    if sep != b'-' && sep != b'/' {
+        return None;
+    }
+    if b[start + 7] != sep {
+        return None;
+    }
+    if !(0..10).all(|k| b[start + k].is_ascii_digit() || k == 4 || k == 7) {
+        return None;
+    }
+    let date_end = start + 10;
+
+    let mut i = date_end;
+    if i >= b.len() || (b[i] != b' ' && b[i] != b'T') {
+        return None;
+    }
+    i += 1;
+    if b.len() < i + 8 || b[i + 2] != b':' || b[i + 5] != b':' {
+        return None;
+    }
+    if !(0..8).all(|k| b[i + k].is_ascii_digit() || k == 2 || k == 5) {
+        return None;
+    }
+    i += 8;
+    // 小数秒
+    if i < b.len() && (b[i] == b'.' || b[i] == b',') {
+        let mut k = i + 1;
+        while k < b.len() && b[k].is_ascii_digit() {
+            k += 1;
+        }
+        if k > i + 1 {
+            i = k;
+        }
+    }
+    Some((date_end, i))
+}
+
+/// 从 `start` 起数 [`LEVEL_MAX_TOKENS`] 个 token，看有没有哪个正好是级别词。
+///
+/// 空白与方括号只当分隔符、不占 token，所以 `[main]` 算一个 token、
+/// `[order-1]` 也算一个。整个 token 必须与级别词完全相等：
+/// `ERRORS`、`ERROR_CODE=5` 都不会被当成级别。
+fn find_level(b: &[u8], start: usize) -> Option<(Range<usize>, Level)> {
+    let is_sep = |c: u8| c.is_ascii_whitespace() || c == b'[' || c == b']' || c == b'|';
+
+    let mut i = start;
+    let mut taken = 0usize;
+    while taken < LEVEL_MAX_TOKENS {
+        while i < b.len() && is_sep(b[i]) {
+            i += 1;
+        }
+        if i >= b.len() {
+            return None;
+        }
+        let tok_start = i;
+        while i < b.len() && !is_sep(b[i]) {
+            i += 1;
+        }
+        let tok = &b[tok_start..i];
+        // 行首的结构字段（时间戳、方括号、线程名、logger 名）都是 ASCII。
+        // 一旦取到含非 ASCII 的 token，说明已经读进正文了——中文没有空格分词，
+        // 整段中文会算成一个 token，正文里的 ERROR 就会跟着溜进来。到此为止。
+        if !tok.is_ascii() {
+            return None;
+        }
+        for (word, lv) in Level::WORDS {
+            if tok == word.as_bytes() {
+                return Some((tok_start..i, lv));
+            }
+        }
+        taken += 1;
+    }
+    None
+}
+
+/// 从行首解析出日期、时间与日志级别。
+fn parse_line_head(line: &str) -> LineHead {
+    let b = line.as_bytes();
+    let mut head = LineHead::default();
+
+    // 允许前导的 '[' 与空白：`[2026-09-11 14:33:41.561] INFO ...` 是常见排布
+    let mut i = 0;
+    while i < b.len() && (b[i] == b'[' || b[i] == b' ') {
+        i += 1;
+    }
+    if let Some((date_end, ts_end)) = scan_timestamp(b, i) {
+        head.date = Some(i..date_end);
+        // 日期与时间之间的分隔符（空格或 'T'）不属于任何一段，留作默认色
+        head.time = Some(date_end + 1..ts_end);
+        i = ts_end;
+    }
+    head.level = find_level(b, i);
+    head
+}
+
 /// 绘制一行内容，返回该行被双击时命中的词。
 ///
 /// 这里没有用 `Label::selectable`，而是自己 layout galley 再交给
@@ -680,6 +985,7 @@ impl LogViewApp {
 fn render_content(
     ui: &mut egui::Ui,
     text: &str,
+    head: &LineHead,
     query: &str,
     case_sensitive: bool,
     wrap: bool,
@@ -690,25 +996,18 @@ fn render_content(
         shown = floor_char_boundary(shown, MAX_RENDER_CHARS);
     }
 
-    let base_color = level_color(ui, shown).unwrap_or_else(|| ui.visuals().text_color());
+    let base_color = ui.visuals().text_color();
     let font_id: FontId = TextStyle::Monospace.resolve(ui.style());
-
-    let mut job = if query.is_empty() {
-        egui::text::LayoutJob::single_section(
-            shown.to_string(),
-            egui::TextFormat::simple(font_id.clone(), base_color),
-        )
-    } else {
-        highlighted_job(
-            shown,
-            query,
-            case_sensitive,
-            base_color,
-            &font_id,
-            ui.visuals().dark_mode,
-            regex,
-        )
-    };
+    let highlights = match_ranges(shown, query, case_sensitive, regex);
+    let mut job = styled_job(
+        shown,
+        head,
+        base_color,
+        muted_text(ui.visuals().dark_mode),
+        &font_id,
+        &highlights,
+        ui.visuals().dark_mode,
+    );
     job.wrap.max_width = ui.available_width();
     if !wrap {
         // 不换行时压成单行、超出部分用省略号收尾，等价于原先的 truncate
@@ -787,15 +1086,91 @@ fn word_at(galley: &egui::Galley, pos: egui::Vec2) -> Option<String> {
     Some(chars[start..end].iter().collect())
 }
 
-fn highlighted_job(
+/// 算出这一行里所有被检索命中的字节区间（升序、互不重叠）。
+fn match_ranges(
     text: &str,
     query: &str,
     case_sensitive: bool,
-    base_color: Color32,
-    font_id: &FontId,
-    dark: bool,
     regex: Option<&regex::Regex>,
+) -> Vec<Range<usize>> {
+    // 正则模式：命中范围由表达式自己给出，不必再做大小写归一化
+    if let Some(re) = regex {
+        let mut out = Vec::new();
+        let mut last = 0usize;
+        for m in re.find_iter(text) {
+            // 表达式可能写出重叠匹配，这里只取不重叠的部分
+            if m.end() > m.start() && m.start() >= last {
+                out.push(m.start()..m.end());
+                last = m.end();
+            }
+        }
+        return out;
+    }
+
+    // to_ascii_lowercase 不改变字节长度，可安全用于偏移换算
+    let (hay, needle) = if case_sensitive {
+        (text.to_string(), query.to_string())
+    } else {
+        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
+    };
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (idx, _) in hay.match_indices(&needle) {
+        out.push(idx..idx + needle.len());
+    }
+    out
+}
+
+/// 把一行的样式拼成 LayoutJob：行首结构决定基础色，检索命中叠加底色。
+///
+/// 两套区间会重叠（比如要搜的词恰好就是 `INFO`），所以统一按"所有边界点切段"来做：
+/// 切开之后每一小段要么整个属于某个结构分段、要么整个落在某个命中区间里，逐段定色即可。
+/// 这样只需要一遍 Append，不必为两种高亮各写一套分段逻辑。
+fn styled_job(
+    text: &str,
+    head: &LineHead,
+    base: Color32,
+    muted: Color32,
+    font_id: &FontId,
+    highlights: &[Range<usize>],
+    dark: bool,
 ) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    if text.is_empty() {
+        // 空行也要有一次 append：没有 section 的 job 量不出行高
+        job.append("", 0.0, egui::TextFormat::simple(font_id.clone(), base));
+        return job;
+    }
+
+    // 日期与时间连成一整段（含中间那个分隔符），整段用次要灰。
+    // 曾经让日期再淡一层，浅色主题下对比度不足 3:1，读不清，已撤掉。
+    let ts_range = match (&head.date, &head.time) {
+        (Some(d), Some(t)) => Some(d.start..t.end),
+        (Some(d), None) => Some(d.clone()),
+        (None, Some(t)) => Some(t.clone()),
+        (None, None) => None,
+    };
+    let level_range = head.level.as_ref().map(|(r, _)| r);
+    let level_style = head.level_of().map(|lv| lv.style(dark));
+
+    let mut cuts = vec![0usize, text.len()];
+    for r in [ts_range.as_ref(), level_range].into_iter().flatten() {
+        if r.start <= r.end && r.end <= text.len() {
+            cuts.push(r.start);
+            cuts.push(r.end);
+        }
+    }
+    for h in highlights {
+        if h.start <= h.end && h.end <= text.len() {
+            cuts.push(h.start);
+            cuts.push(h.end);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
     let hit_bg = if dark {
         Color32::from_rgb(140, 110, 20)
     } else {
@@ -806,80 +1181,40 @@ fn highlighted_job(
     } else {
         Color32::from_rgb(60, 40, 0)
     };
-    let mut job = egui::text::LayoutJob::default();
-    let push = |job: &mut egui::text::LayoutJob, s: &str, hl: bool| {
-        let mut f = egui::TextFormat::simple(font_id.clone(), if hl { hit_fg } else { base_color });
-        if hl {
-            f.background = hit_bg;
-        }
-        job.append(s, 0.0, f);
-    };
 
-    // 正则模式：高亮范围由表达式自己给出，不必再做大小写归一化
-    if let Some(re) = regex {
-        let mut last = 0usize;
-        for m in re.find_iter(text) {
-            if m.start() > last {
-                push(&mut job, &text[last..m.start()], false);
+    // 切点与命中区间都是升序，双指针扫一遍就够，不必对每段重查命中列表
+    let mut hi = 0usize;
+    for w in cuts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        if s >= e {
+            continue;
+        }
+        while hi < highlights.len() && highlights[hi].end <= s {
+            hi += 1;
+        }
+
+        let mut fmt = egui::TextFormat::simple(font_id.clone(), base);
+        if let (Some(st), Some(r)) = (&level_style, level_range) {
+            if r.contains(&s) {
+                fmt.color = st.fg;
+                if let Some(bg) = st.bg {
+                    fmt.background = bg;
+                }
             }
-            if m.end() > m.start() {
-                push(&mut job, &text[m.start()..m.end()], true);
+        }
+        if let Some(r) = &ts_range {
+            if r.contains(&s) {
+                fmt.color = muted;
             }
-            last = last.max(m.end());
         }
-        if last < text.len() {
-            push(&mut job, &text[last..], false);
+        // 命中最后覆盖：搜的就是级别词时，看到的应该是命中而不是级别标签
+        if hi < highlights.len() && highlights[hi].start <= s {
+            fmt.color = hit_fg;
+            fmt.background = hit_bg;
         }
-        return job;
-    }
-
-    // to_ascii_lowercase 不改变字节长度，可安全用于偏移换算
-    let (hay, needle) = if case_sensitive {
-        (text.to_string(), query.to_string())
-    } else {
-        (text.to_ascii_lowercase(), query.to_ascii_lowercase())
-    };
-
-    if needle.is_empty() {
-        push(&mut job, text, false);
-        return job;
-    }
-
-    let mut last = 0usize;
-    for (idx, _) in hay.match_indices(&needle) {
-        if idx > last {
-            push(&mut job, &text[last..idx], false);
-        }
-        push(&mut job, &text[idx..idx + needle.len()], true);
-        last = idx + needle.len();
-    }
-    if last < text.len() {
-        push(&mut job, &text[last..], false);
+        job.append(&text[s..e], 0.0, fmt);
     }
     job
-}
-
-/// 按日志级别给整行上色
-fn level_color(ui: &egui::Ui, line: &str) -> Option<Color32> {
-    // 只取行首一小段做级别判定即可。截断必须落在字符边界上：
-    // 中文日志里第 200 个字节经常正好落在一个汉字的中间，直接切片会 panic。
-    let head = floor_char_boundary(line, 200);
-    let v = ui.visuals();
-    if head.contains("FATAL") || head.contains("ERROR") || head.contains("SEVERE") {
-        Some(v.error_fg_color)
-    } else if head.contains("WARN") {
-        Some(v.warn_fg_color)
-    } else if head.contains("INFO") {
-        Some(if v.dark_mode {
-            Color32::from_rgb(120, 190, 255)
-        } else {
-            Color32::from_rgb(20, 90, 190)
-        })
-    } else if head.contains("DEBUG") || head.contains("TRACE") {
-        Some(v.weak_text_color())
-    } else {
-        None
-    }
 }
 
 fn floor_char_boundary(s: &str, max: usize) -> &str {
@@ -900,6 +1235,18 @@ fn floor_char_boundary(s: &str, max: usize) -> &str {
 /// 而不是含糊的一句"结果不完整"，看完仍不知道是没命中还是没搜。
 fn truncated_hits_label(navigable_lines: usize, reach_line: usize, total_hits: usize) -> String {
     format!("可跳转前 {navigable_lines} 行（到第 {reach_line} 行）；全文共 {total_hits} 处命中")
+}
+
+/// 主题三态循环：跟随系统 → 浅色 → 深色 → 跟随系统。
+///
+/// 抽成纯函数是为了能直接断言——塞在按钮点击回调里就只能靠手点了。
+/// 之所以要三态而不是简单取反：取反的话一旦点过就再也回不到"跟随系统"。
+fn next_theme(current: Option<bool>) -> Option<bool> {
+    match current {
+        None => Some(false),
+        Some(false) => Some(true),
+        Some(true) => None,
+    }
 }
 
 fn human_size(n: usize) -> String {
@@ -1296,24 +1643,256 @@ mod word_tests {
         let galley = layout(&ctx, "     ");
         assert_eq!(word_at(&galley, egui::vec2(1.0, 5.0)), None);
     }
+}
 
-    /// 级别判定只取行首一小段，中文日志里第 200 个字节常常正落在汉字中间。
-    /// 按字节直接切片会 panic——打开文件即闪退，正是这个原因。
+/// 行首结构的识别，以及一条曾经的误判：
+/// 原先"整行包含 ERROR 就给整行染色"，正文里提到 ERROR 也会被当成错误行。
+#[cfg(test)]
+mod line_head_tests {
+    use super::*;
+
+    fn job_for(line: &str, query: &str) -> egui::text::LayoutJob {
+        styled_job(
+            line,
+            &parse_line_head(line),
+            Color32::BLACK,
+            muted_text(false),
+            &FontId::monospace(12.0),
+            &match_ranges(line, query, true, None),
+            false,
+        )
+    }
+
+    /// 把 LayoutJob 的各段拼回来
+    fn sections_text(job: &egui::text::LayoutJob) -> String {
+        job.sections
+            .iter()
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect()
+    }
+
+    fn slice<'a>(line: &'a str, r: Option<&Range<usize>>) -> Option<&'a str> {
+        r.map(|r| &line[r.clone()])
+    }
+
     #[test]
-    fn level_color_truncates_on_char_boundary() {
-        let ctx = setup_ctx();
-        // 前 198 字节为 ASCII，紧随其后的汉字占据 198..201，第 200 字节在其内部
-        let line = format!("ERROR {}{}", "a".repeat(192), "查找");
-        assert!(line.len() > 200);
-        assert!(!line.is_char_boundary(200), "前提：构造的行应跨越字符边界");
+    fn parses_timestamp_and_level() {
+        let line = "2026-09-11 14:33:41.561 INFO c.s.pspace.X - hello";
+        let head = parse_line_head(line);
+        assert_eq!(slice(line, head.date.as_ref()), Some("2026-09-11"));
+        assert_eq!(slice(line, head.time.as_ref()), Some("14:33:41.561"));
+        let (r, lv) = head.level.clone().expect("应识别出级别");
+        assert_eq!(&line[r], "INFO");
+        assert_eq!(lv, Level::Info);
+    }
 
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+    /// 核心回归：正文里的 ERROR 不是级别。
+    /// 旧实现用 `head.contains("ERROR")` 判断，这一行会被整行染成错误色。
+    #[test]
+    fn level_word_inside_the_message_is_not_the_level() {
+        let line = "2026-09-11 14:33:41.561 INFO c.s.X - 检测到 3 个 ERROR 已忽略";
+        assert_eq!(parse_line_head(line).level_of(), Some(Level::Info));
+
+        // 行首结构里根本没有级别词时，正文提到多少级别词都不认
+        let no_level = "2026-09-11 14:33:41.561 c.s.X - 检测到 3 个 ERROR 已忽略";
+        assert_eq!(parse_line_head(no_level).level_of(), None);
+    }
+
+    /// 中文开头的行：整段中文会算成一个 token，正文里的 ERROR 不能因此溜进来
+    #[test]
+    fn chinese_prefix_stops_the_level_lookup() {
+        assert_eq!(parse_line_head("正在检查 ERROR 日志").level_of(), None);
+        assert_eq!(
+            parse_line_head("2026-09-11 14:33:41.561 检测到 ERROR 已忽略").level_of(),
+            None
+        );
+    }
+
+    /// 必须整个 token 相等：ERRORS / ERROR_CODE=5 都不是级别
+    #[test]
+    fn level_must_be_a_whole_token() {
+        assert_eq!(
+            parse_line_head("ERROR 已处理").level_of(),
+            Some(Level::Error)
+        );
+        assert_eq!(parse_line_head("ERRORS 已处理").level_of(), None);
+        assert_eq!(parse_line_head("ERROR_CODE=5").level_of(), None);
+        // 只数头几个 token，正文里的词够不着
+        assert_eq!(
+            parse_line_head("c.s.X - 检测到 ERROR 已忽略").level_of(),
+            None
+        );
+    }
+
+    /// 常见排布都要认：无时间戳、带方括号、线程名在中间、逗号小数秒
+    #[test]
+    fn tolerates_common_layouts() {
+        assert_eq!(
+            parse_line_head("INFO 服务已启动").level_of(),
+            Some(Level::Info)
+        );
+        assert_eq!(
+            parse_line_head("WARN 磁盘剩余 5%").level_of(),
+            Some(Level::Warn)
+        );
+
+        let bracketed = "[2026-09-11 14:33:41,561] [main] ERROR c.s.X - 慢查询";
+        let head = parse_line_head(bracketed);
+        assert_eq!(
+            slice(bracketed, head.date.as_ref()),
+            Some("2026-09-11"),
+            "带方括号与逗号小数秒也要认出日期"
+        );
+        assert_eq!(head.level_of(), Some(Level::Error));
+    }
+
+    /// 时间戳之后出现的第一个级别词才算数，别被正文里更靠后的别的级别盖过去
+    #[test]
+    fn picks_the_level_right_after_the_timestamp() {
+        let line = "2026-09-11 14:33:41.561 WARN c.s.X - 上一行报的是 ERROR，这里是 WARN";
+        assert_eq!(parse_line_head(line).level_of(), Some(Level::Warn));
+    }
+
+    /// 分段必须完整覆盖原行、不丢字不重复 —— 这同时守住了"不切在汉字中间"。
+    /// 老实现是"取行首 200 字节"，中文日志里第 200 字节常常正落在汉字内部，
+    /// 直接切片 panic（打开文件即闪退就是这个原因）；现在不再对整行做字节切片。
+    #[test]
+    fn sections_cover_the_line_exactly_once() {
+        let line = format!("ERROR {}{}", "a".repeat(192), "查找");
+        assert!(!line.is_char_boundary(200), "前提：构造的行应跨越字符边界");
+        assert_eq!(sections_text(&job_for(&line, "查找")), line);
+    }
+
+    /// 命中区间压在时间戳或级别上时（两套区间重叠），分段仍然完整
+    #[test]
+    fn overlapping_highlight_and_structure_stay_consistent() {
+        for line in [
+            "2026-09-11 14:33:41.561 INFO c.s.X - INFO 又出现一次",
+            "2026-09-11 14:33:41.561 ERROR 时间戳里也有 14:33",
+            "没有可识别结构的一行中文日志",
+        ] {
+            for query in ["INFO", "ERROR", "14:33", "2026-09-11", "不存在"] {
+                let job = job_for(line, query);
+                assert_eq!(sections_text(&job), line, "query={query} line={line}");
+            }
+        }
+    }
+
+    /// WCAG 相对亮度
+    fn luminance(c: Color32) -> f32 {
+        let ch = |v: u8| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    }
+
+    /// WCAG 对比度，1:1 到 21:1
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// 次要文字可以弱，但不能弱到读不动。
+    ///
+    /// 这条是老许用出来的：早先日期取 `weak_text_color().linear_multiply(0.62)`、
+    /// 时间取 `weak_text_color()`，浅色主题下对比度只有 3:1 上下，他直接说"看不清"。
+    /// 靠眼睛发现这类问题太晚，所以把下限钉成断言。
+    #[test]
+    fn text_meets_wcag_aa_on_both_themes() {
+        for dark in [false, true] {
+            let visuals = if dark {
+                egui::Visuals::dark()
+            } else {
+                egui::Visuals::light()
+            };
+            let bg = visuals.panel_fill;
+            let name = if dark { "深色" } else { "浅色" };
+
+            let ratio = contrast(muted_text(dark), bg);
+            assert!(
+                ratio >= 4.5,
+                "{name}主题下时间戳对比度只有 {ratio:.2}:1，低于 WCAG AA 的 4.5:1"
+            );
+
+            let body = contrast(visuals.text_color(), visuals.extreme_bg_color);
+            assert!(body >= 4.5, "{name}主题下正文对比度只有 {body:.2}:1");
+
+            // 主按钮：白字要读得出（4.5:1），按钮本身相对背景要看得出来
+            // （非文本 UI 元素按 WCAG 只要 3:1，但它是整屏唯一的主操作，别让它糊进背景）
+            let primary = hex(PRIMARY_FILL);
+            let on_fill = contrast(Color32::WHITE, primary);
+            assert!(
+                on_fill >= 4.5,
+                "{name}主题下主按钮的白字对比度只有 {on_fill:.2}:1"
+            );
+            let vs_bg = contrast(primary, bg);
+            assert!(
+                vs_bg >= 3.0,
+                "{name}主题下主按钮相对背景只有 {vs_bg:.2}:1，作为 UI 元素应 ≥ 3:1"
+            );
+
+            for lv in [Level::Error, Level::Warn, Level::Info, Level::Debug] {
+                let st = lv.style(dark);
+                let r = contrast(st.fg, st.bg.unwrap_or(bg));
                 assert!(
-                    level_color(ui, &line).is_some(),
-                    "行首含 ERROR，应当照常着色而不是崩溃"
+                    r >= 4.5,
+                    "{name}主题下 {lv:?} 级别的文字对比度只有 {r:.2}:1"
                 );
-            });
-        });
+            }
+        }
+    }
+
+    /// 时间/日期/级别三段各自着色，且互不重叠
+    #[test]
+    fn styles_are_applied_to_the_expected_ranges() {
+        let line = "2026-09-11 14:33:41.561 ERROR c.s.X - boom";
+        let job = job_for(line, "");
+        let head = parse_line_head(line);
+
+        let color_at = |at: usize| {
+            job.sections
+                .iter()
+                .find(|s| s.byte_range.contains(&at))
+                .map(|s| s.format.color)
+        };
+        let date = color_at(head.date.as_ref().unwrap().start).unwrap();
+        let time = color_at(head.time.as_ref().unwrap().start).unwrap();
+        let level = head.level.as_ref().unwrap().0.start;
+        let lv_sec = job
+            .sections
+            .iter()
+            .find(|s| s.byte_range.contains(&level))
+            .unwrap();
+        assert_eq!(lv_sec.format.color, Level::Error.style(false).fg);
+        assert_eq!(
+            lv_sec.format.background,
+            Level::Error.style(false).bg.unwrap()
+        );
+        assert_eq!(date, time, "日期与时间应同为可读的次要灰");
+        assert_ne!(time, Color32::BLACK, "时间不该用正文色");
+    }
+}
+
+/// 主题按钮的三态循环。抽成纯函数就是为了这条断言能直接跑。
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// 跟随系统 → 浅色 → 深色 → 跟随系统，一圈要能回到原点。
+    /// 若写成简单取反，点过一次就再也回不到"跟随系统"。
+    #[test]
+    fn theme_cycles_through_all_three_states() {
+        assert_eq!(next_theme(None), Some(false), "跟随系统之后应到浅色");
+        assert_eq!(next_theme(Some(false)), Some(true), "浅色之后应到深色");
+        assert_eq!(next_theme(Some(true)), None, "深色之后应回到跟随系统");
+
+        let back = next_theme(next_theme(next_theme(None)));
+        assert_eq!(back, None, "三次点击应回到起点");
     }
 }
