@@ -123,7 +123,11 @@ jobs:
           fi
 
       # macOS 必须打成 .app：Finder 遇到裸二进制会交给终端执行，
-      # 双击就会弹出一个终端窗口，而 Windows 靠 PE 头部标记解决这个问题
+      # 双击就会弹出一个终端窗口，而 Windows 靠 PE 头部标记解决这个问题。
+      #
+      # 三个平台都在压缩包里套一层与压缩包同名的目录：解压不会把文件散在当前目录里，
+      # 几个版本解压到同一个下载目录也不会互相覆盖（旧版 Linux 直接摊在根上，
+      # 加了 .desktop 与 icons/ 之后尤其乱）。
       - name: 打包（macOS，包成 .app）
         if: runner.os == 'macOS'
         shell: bash
@@ -133,7 +137,11 @@ jobs:
             "." \
             "${{ steps.ver.outputs.value }}"
           NAME="logview-v${{ steps.ver.outputs.value }}-${{ matrix.target }}"
-          tar -czf "$NAME.tar.gz" logview.app
+          # 用 mv 而不是 cp：同一个文件系统内移动会原样保留符号链接、扩展属性与签名
+          mkdir -p "$NAME"
+          mv logview.app "$NAME/"
+          tar -czf "$NAME.tar.gz" "$NAME"
+          rm -rf "$NAME"
           echo "产物大小：$(du -h "$NAME.tar.gz" | cut -f1)"
 
       # Linux 的"程序图标"不在可执行文件里（不像 Windows 的 PE 资源、macOS 的 .app），
@@ -146,13 +154,14 @@ jobs:
         run: |
           NAME="logview-v${{ steps.ver.outputs.value }}-${{ matrix.target }}"
           STAGE=$(mktemp -d)
-          install -Dm755 target/${{ matrix.target }}/release/logview "$STAGE/logview"
-          install -Dm644 assets/logview.desktop "$STAGE/logview.desktop"
+          DEST="$STAGE/$NAME"
+          install -Dm755 target/${{ matrix.target }}/release/logview "$DEST/logview"
+          install -Dm644 assets/logview.desktop "$DEST/logview.desktop"
           for s in 16 32 64 128 256 512; do
             install -Dm644 "assets/icon-$s.png" \
-              "$STAGE/icons/hicolor/${s}x${s}/apps/logview.png"
+              "$DEST/icons/hicolor/${s}x${s}/apps/logview.png"
           done
-          tar -czf "$NAME.tar.gz" -C "$STAGE" logview logview.desktop icons
+          tar -czf "$NAME.tar.gz" -C "$STAGE" "$NAME"
           echo "产物大小：$(du -h "$NAME.tar.gz" | cut -f1)"
           tar -tzf "$NAME.tar.gz" | sed 's/^/  /'
 
@@ -164,10 +173,11 @@ jobs:
           # 用 + 拼接而不是 "$name.zip"：双引号里 "$name.zip" 会被当作属性访问尝试，
           # 语义随 PowerShell 版本和变量类型而变，显式拼接没有这层歧义
           $zip = $name + ".zip"
-          Compress-Archive `
-            -Path target/${{ matrix.target }}/release/logview.exe `
-            -DestinationPath $zip `
-            -Force
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/logview.exe $stage
+          # 压缩整个目录，压缩包里就会带上这一层
+          Compress-Archive -Path $stage -DestinationPath $zip -Force
           Get-Item $zip | Select-Object Name, Length
 
       - name: 上传构建产物

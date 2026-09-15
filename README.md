@@ -103,15 +103,17 @@ WARN / ERROR 的行会在最左侧挂一条色条（上图用 `▌` 表示），
 
 | 文件 | 平台 |
 |---|---|
-| `logview-v0.1.9-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
-| `logview-v0.1.9-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
-| `logview-v0.1.9-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
-| `logview-v0.1.9-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `logview-v0.1.10-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `logview-v0.1.10-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+| `logview-v0.1.10-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+| `logview-v0.1.10-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
 
 文件名里的版本号与 Release 标签一致，下载到本地堆几个版本也不会混淆
-（v0.1.8 及更早的包名不带版本号）。
+（v0.1.8 及更早的包名不带版本号）。**v0.1.10 起**每个压缩包解压后都是**与压缩包同名的一层目录**，
+可执行文件在这一层的根部（macOS 是 `logview.app`），
+所以把几个版本解压到同一个目录也不会互相覆盖。
 
-macOS 的压缩包解压后是 `logview.app`，**双击即可运行**——不是裸二进制，
+macOS 的 `logview.app` **双击即可运行**——不是裸二进制，
 所以不会弹出终端窗口。若想在终端里使用，执行
 `logview.app/Contents/MacOS/logview`。
 
