@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=logview
+Name[zh_CN]=logview 日志查看器
+Comment=Viewer for huge log files
+Comment[zh_CN]=大日志文件查看器
+Exec=logview %f
+Icon=logview
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=logview

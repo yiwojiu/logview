@@ -103,10 +103,13 @@ WARN / ERROR 的行会在最左侧挂一条色条（上图用 `▌` 表示），
 
 | 文件 | 平台 |
 |---|---|
-| `logview-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
-| `logview-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
-| `logview-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
-| `logview-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `logview-v0.1.9-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `logview-v0.1.9-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+| `logview-v0.1.9-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+| `logview-v0.1.9-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+
+文件名里的版本号与 Release 标签一致，下载到本地堆几个版本也不会混淆
+（v0.1.8 及更早的包名不带版本号）。
 
 macOS 的压缩包解压后是 `logview.app`，**双击即可运行**——不是裸二进制，
 所以不会弹出终端窗口。若想在终端里使用，执行
@@ -121,6 +124,30 @@ sha256sum -c SHA256SUMS.txt            # Linux
 
 Windows 需要 [VC++ 2015-2022 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 （绝大多数机器已预装；缺失时 Windows 会提示缺少 `VCRUNTIME140.dll`）。
+
+Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.04+ 都满足）。
+发布流程用 [zig](https://ziglang.org/) 当链接器把这个底线钉死，否则默认构建机
+（Ubuntu 24.04，glibc 2.39）编出来的产物会在 CentOS 8、Ubuntu 22.04 这类机器上报
+`GLIBC_2.34 not found` —— 看着像文件坏了，其实是构建环境太新。产物只硬依赖
+`libc` / `libm` / `libgcc_s`，X11、Wayland、OpenGL 都是**运行时**动态加载的。
+
+> **Linux 上需要图形环境。** 这是 GUI 程序：进程能起来，但要弹出窗口得有 X11 或 Wayland
+> （纯 SSH 终端里跑不了，远程看建议在本地或远程桌面上开 Windows 版）。
+> 起不来时原因会打到 stderr，终端里能看到。
+
+想让它出现在应用菜单里、并带上自己的图标，把压缩包里的 `.desktop` 与 `icons/` 装到用户目录：
+
+```bash
+install -Dm755 logview ~/.local/bin/logview
+install -Dm644 logview.desktop ~/.local/share/applications/logview.desktop
+cp -r icons/* ~/.local/share/icons/
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+`icons/` 是 hicolor 主题的标准尺寸（16 / 32 / 64 / 128 / 256 / 512）。
+**图标为什么要在外面装**：Linux 不像 Windows 把图标嵌进可执行文件，也不像 macOS 打进 `.app`——
+窗口图标是运行时设的（X11 下走 `_NET_WM_ICON`，不装也能看到），
+而 **Wayland 下合成器要靠 `.desktop` 把窗口与图标对上**，不装就只有默认图标。
 
 渲染走 **D3D12**（wgpu），远程桌面会话、虚拟机与没装显卡驱动的机器上都能正常打开；
 没有硬件显卡时会回退到软件渲染（WARP），界面能用但滚动会慢一些。
