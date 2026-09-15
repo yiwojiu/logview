@@ -67,7 +67,64 @@ fn install_panic_dialog() {
 #[cfg(debug_assertions)]
 fn install_panic_dialog() {}
 
-fn main() -> eframe::Result<()> {
+/// 当前是不是远程桌面会话。
+///
+/// 远程会话里的显示驱动通常只提供 OpenGL 1.1，而默认的 glow 后端需要更高版本——
+/// 把这条信息带进报错里能省掉一轮猜测。读环境变量即可，不必为此引入 windows 依赖。
+fn session_kind() -> &'static str {
+    session_kind_from(std::env::var("SESSIONNAME").ok().as_deref())
+}
+
+fn session_kind_from(name: Option<&str>) -> &'static str {
+    match name {
+        Some(s) if s.starts_with("RDP") => "远程桌面会话",
+        Some(_) => "本地会话",
+        None => "未知",
+    }
+}
+
+/// 启动失败时把原因摆到用户面前。
+///
+/// release 跑在 Windows 图形子系统下，进程没有 stderr：`run_native` 返回 Err
+/// （最典型的是创建 OpenGL 上下文失败——远程桌面、虚拟机或没装显卡驱动的机器上
+/// 可能只有 OpenGL 1.1）时，双击运行的表现就是「什么都没发生」，连原因都拿不到。
+/// panic 有钩子兜着，`Result::Err` 之前没有，这里补上。
+fn report_startup_failure(err: &eframe::Error) {
+    let detail = format!(
+        "logview 无法创建窗口，已退出。\n\n\
+         原因：{err}\n\n\
+         运行环境：{}\n\n\
+         若提示与图形加速有关，可以试：\n\
+         · 在本机登录（而不是远程桌面）后运行\n\
+         · 安装或更新显卡驱动",
+        session_kind()
+    );
+
+    eprintln!("{detail}");
+
+    #[cfg(not(debug_assertions))]
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("logview 启动失败")
+        .set_description(&detail)
+        .show();
+}
+
+/// 渲染后端：Windows 走 D3D12，其余平台走 OpenGL。理由见 `Cargo.toml`。
+///
+/// 关键在于远程桌面会话只提供 OpenGL 1.1，glow 起不来窗口——而"在服务器上看日志"
+/// 正是这类工具最常见的用法之一。
+#[cfg(windows)]
+fn preferred_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
+}
+
+#[cfg(not(windows))]
+fn preferred_renderer() -> eframe::Renderer {
+    eframe::Renderer::Glow
+}
+
+fn main() -> std::process::ExitCode {
     install_panic_dialog();
 
     // 支持 `logview app.log` 直接打开
@@ -81,10 +138,13 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([640.0, 400.0])
             .with_icon(load_icon()),
+        // 走 D3D12 而不是 OpenGL：远程桌面、虚拟机与无显卡驱动的机器上
+        // OpenGL 往往只有 1.1，起不来窗口（详见 Cargo.toml 里的说明）。
+        renderer: preferred_renderer(),
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "logview",
         options,
         Box::new(move |cc| {
@@ -95,5 +155,26 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            report_startup_failure(&err);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 报错里要能区分远程会话——那是最常见的"OpenGL 只有 1.1"场景
+    #[test]
+    fn detects_remote_sessions() {
+        assert_eq!(session_kind_from(Some("RDP-Tcp#12")), "远程桌面会话");
+        assert_eq!(session_kind_from(Some("Console")), "本地会话");
+        assert_eq!(session_kind_from(None), "未知");
+    }
 }

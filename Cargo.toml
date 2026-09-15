@@ -1,6 +1,6 @@
 [package]
 name = "logview"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Cross-platform viewer for huge log files, built with egui"
 license = "MIT OR Apache-2.0"
@@ -14,7 +14,6 @@ name = "logview"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.31"
 egui = "0.31"
 memmap2 = "0.9"
 memchr = "2"
@@ -22,6 +21,38 @@ encoding_rs = "0.8"
 rfd = "0.15"
 anyhow = "1"
 regex = "1"
+
+# 渲染后端按平台分开。
+#
+# Windows 走 wgpu + D3D12 而不是默认的 glow（OpenGL）：glow 需要 OpenGL 3.2+，
+# 而远程桌面会话的显示驱动通常只提供 OpenGL 1.1——上下文创建失败，窗口根本建不起来。
+# 对日志查看器来说这是硬伤：这类工具最常见的用法就是在服务器上跑，而服务器基本没有独显。
+# D3D12 在远程桌面下可用（RDP 支持 D3D 加速，没有硬件卡时还能回退软件渲染）。
+# 其余平台保持 glow：macOS 与 Linux 上它已经稳定，没必要为同一个问题多背几 MB。
+#
+# 另外注意：eframe 0.31 声明 wgpu 时用了 `default-features = false` 且只补了
+# `metal` + `webgpu`（见 eframe 自己的 Cargo.toml），**默认集里的 `dx12` 因此被关掉了**。
+# 只打开 eframe 的 `wgpu` feature 的话，Windows 上会只剩 Vulkan 与 GLES 两个后端，
+# 而远程桌面里 Vulkan 通常也不可用，等于白切。所以把 dx12 显式补上——
+# Cargo 的 feature 取并集，与 eframe 的声明不冲突，只需版本与它用的 wgpu 一致。
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
+
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
 
 [dev-dependencies]
 encoding_rs = "0.8"

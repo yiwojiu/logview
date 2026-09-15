@@ -119,6 +119,16 @@ shasum -a 256 -c SHA256SUMS.txt        # macOS
 sha256sum -c SHA256SUMS.txt            # Linux
 ```
 
+Windows 需要 [VC++ 2015-2022 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+（绝大多数机器已预装；缺失时 Windows 会提示缺少 `VCRUNTIME140.dll`）。
+
+渲染走 **D3D12**（wgpu），远程桌面会话、虚拟机与没装显卡驱动的机器上都能正常打开；
+没有硬件显卡时会回退到软件渲染（WARP），界面能用但滚动会慢一些。
+不用 OpenGL 是因为远程桌面的显示驱动往往只提供 OpenGL 1.1，那种环境下 OpenGL
+后端根本建不起窗口——而"在服务器上看日志"恰恰是这类工具的常见用法。
+万一窗口仍然起不来，程序会弹出对话框说明原因（release 没有 stderr，不弹就只能看到
+「双击没反应」）。
+
 > **macOS 首次打开的额外一步。** 产物只做了 ad-hoc 签名，没有 Apple 开发者
 > 签名与公证，因此 Gatekeeper 会拦下第一次启动——这是预期行为，不表示文件损坏。
 >
