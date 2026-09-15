@@ -136,6 +136,17 @@ Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.0
 > **Linux 上需要图形环境。** 这是 GUI 程序：进程能起来，但要弹出窗口得有 X11 或 Wayland
 > （纯 SSH 终端里跑不了，远程看建议在本地或远程桌面上开 Windows 版）。
 > 起不来时原因会打到 stderr，终端里能看到。
+>
+> **窗口起不来时，换个渲染后端再试一次。** X11 下的 GL 实现不由程序决定 —— eframe 固定
+> "GLX 优先，失败才退 EGL"，且没有环境变量可改；而某些远程 X 会话（VNC、远程控制台）的
+> GLX 会让它崩在 `GLXBadContextTag` 上。这时换成 wgpu 就绕开了（wgpu 走 Vulkan 或 EGL，
+> 完全不碰 GLX）：
+>
+> ```bash
+> LOGVIEW_RENDERER=wgpu ./logview     # 换回 OpenGL 就是 LOGVIEW_RENDERER=glow
+> ```
+>
+> macOS 的产物里没有编进 wgpu，指定它会被忽略并回退到 glow。
 
 想让它出现在应用菜单里、并带上自己的图标，把压缩包里的 `.desktop` 与 `icons/` 装到用户目录：
 

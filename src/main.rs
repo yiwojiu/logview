@@ -14,6 +14,9 @@ use logview::fonts;
 const ICON_SIZE: u32 = 128;
 const ICON_RGBA: &[u8] = include_bytes!("../assets/icon-128.rgba");
 
+/// 覆盖渲染后端的环境变量，取值 `wgpu` 或 `glow`（不区分大小写）
+const ENV_RENDERER: &str = "LOGVIEW_RENDERER";
+
 fn load_icon() -> egui::IconData {
     debug_assert_eq!(
         ICON_RGBA.len(),
@@ -94,8 +97,9 @@ fn report_startup_failure(err: &eframe::Error) {
         "logview 无法创建窗口，已退出。\n\n\
          原因：{err}\n\n\
          运行环境：{}\n\n\
-         若提示与图形加速有关，可以试：\n\
-         · 在本机登录（而不是远程桌面）后运行\n\
+         若提示与图形有关，可以试：\n\
+         · 换渲染后端：LOGVIEW_RENDERER=wgpu ./logview（或 =glow）\n\
+         · 在本机登录（而不是远程桌面 / 远程 X 会话）后运行\n\
          · 安装或更新显卡驱动",
         session_kind()
     );
@@ -114,13 +118,59 @@ fn report_startup_failure(err: &eframe::Error) {
 ///
 /// 关键在于远程桌面会话只提供 OpenGL 1.1，glow 起不来窗口——而"在服务器上看日志"
 /// 正是这类工具最常见的用法之一。
-#[cfg(windows)]
+///
+/// 可以用 `LOGVIEW_RENDERER=wgpu` / `=glow` 覆盖默认值。这是留给"默认那条路在你这台
+/// 机器上走不通"的出口：X11 下 eframe 固定 GLX 优先（没有环境变量可改），
+/// 而某些远程 X 会话的 GLX 会让 glutin 崩在 `GLXBadContextTag` 上，换个后端就绕开了。
 fn preferred_renderer() -> eframe::Renderer {
+    let requested = std::env::var(ENV_RENDERER).ok();
+    match renderer_override(requested.as_deref()) {
+        Some(r) => r,
+        None => {
+            // 设了值却没生效时要说一声：可能是拼错了，也可能是这个平台没编那个后端
+            // （`Renderer` 的变体按 feature 存在与否，Windows 上就没有 glow）。
+            if let Some(v) = requested
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                eprintln!(
+                    "{ENV_RENDERER}={v} 未生效（取值有误，或本平台未编入该后端），按默认后端运行"
+                );
+            }
+            default_renderer()
+        }
+    }
+}
+
+/// 解析 `LOGVIEW_RENDERER` 的取值。没指定、拼错、或该后端在本平台没编进来时返回 `None`，
+/// 即"按平台默认来"——而不是崩掉。
+///
+/// 抽成纯函数是为了能直接断言——塞在 env 读取里面就只能靠手设环境变量试。
+fn renderer_override(value: Option<&str>) -> Option<eframe::Renderer> {
+    let want = value?.trim();
+
+    // 可用性必须与 `Cargo.toml` 的按平台 feature 声明一致：Windows 只编 wgpu、
+    // macOS 只编 glow，引用没编进来的变体连编译都过不了，所以这里用同样的 cfg 挡一层。
+    #[cfg(not(windows))]
+    if want.eq_ignore_ascii_case("glow") {
+        return Some(eframe::Renderer::Glow);
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    if want.eq_ignore_ascii_case("wgpu") {
+        return Some(eframe::Renderer::Wgpu);
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn default_renderer() -> eframe::Renderer {
     eframe::Renderer::Wgpu
 }
 
 #[cfg(not(windows))]
-fn preferred_renderer() -> eframe::Renderer {
+fn default_renderer() -> eframe::Renderer {
     eframe::Renderer::Glow
 }
 
@@ -176,5 +226,43 @@ mod tests {
         assert_eq!(session_kind_from(Some("RDP-Tcp#12")), "远程桌面会话");
         assert_eq!(session_kind_from(Some("Console")), "本地会话");
         assert_eq!(session_kind_from(None), "未知");
+    }
+
+    /// 换后端这个出口要认得住常见写法，也要能拒绝乱填的值
+    #[test]
+    fn parses_renderer_override() {
+        // 与平台无关的部分：没设、留空、拼错 —— 都当作"按平台默认来"，而不是崩掉
+        assert_eq!(renderer_override(None), None);
+        assert_eq!(renderer_override(Some("")), None);
+        assert_eq!(renderer_override(Some("   ")), None);
+        assert_eq!(renderer_override(Some("vulkan")), None);
+
+        // 可用的后端随平台而变（与 Cargo.toml 的 feature 声明一致），
+        // 所以断言也跟着 cfg 走，而不是写一个"哪里都能过"的空断言
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            assert!(matches!(
+                renderer_override(Some("wgpu")),
+                Some(eframe::Renderer::Wgpu)
+            ));
+            assert!(
+                matches!(
+                    renderer_override(Some("  WGPU ")),
+                    Some(eframe::Renderer::Wgpu)
+                ),
+                "应忽略大小写与空白"
+            );
+        }
+        #[cfg(not(windows))]
+        assert!(matches!(
+            renderer_override(Some("glow")),
+            Some(eframe::Renderer::Glow)
+        ));
+        #[cfg(windows)]
+        assert_eq!(
+            renderer_override(Some("glow")),
+            None,
+            "Windows 产物里没有编 glow，这个值应被当成不可用"
+        );
     }
 }

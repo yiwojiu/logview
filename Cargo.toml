@@ -45,7 +45,25 @@ eframe = { version = "0.31", default-features = false, features = [
 ] }
 wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
 
-[target.'cfg(not(windows))'.dependencies]
+# Linux：默认仍然是 glow，但**同时编进 wgpu**，可用 LOGVIEW_RENDERER=wgpu 切换。
+#
+# 原因是 X11 下的 GL 实现不由我们决定：eframe 写死了 "GLX 优先，失败才退 EGL"
+# （glutin-winit 的 ApiPreference::FallbackEgl），且没有环境变量可改。
+# 而某些远程 X 会话（VNC / 远程控制台）的 GLX 会让 glutin 崩在 GLXBadContextTag 上——
+# 那时换 wgpu 走 Vulkan 或 **EGL**，完全不碰 GLX，是另一条独立的路。
+# 代价是 Linux 产物多几 MB；正常桌面上 glow 一直好好的，所以默认不动它。
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
+
+# macOS：只保留 glow。那边它一直正常，没必要多背几 MB 的 wgpu
+[target.'cfg(all(not(windows), not(target_os = "linux")))'.dependencies]
 eframe = { version = "0.31", default-features = false, features = [
     "accesskit",
     "default_fonts",
