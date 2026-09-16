@@ -26,10 +26,14 @@ jobs:
           # macOS 的 Intel 机器（在 arm runner 上交叉编译）
           - os: macos-latest
             target: x86_64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          # Linux 暂不发布预编译产物（v0.1.12 起）。前几版都卡在 GLX/EGL 上，
+          # 在没确认能打开之前，发一个起不来的包只会让下载的人白折腾。
+          # 代码本身仍然支持 Linux —— CI 三个平台都在编译与测试 —— 要恢复 Linux 包，
+          # 把这行加回来即可：
+          # - os: ubuntu-latest
+          #   target: x86_64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -44,68 +48,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: 安装 Linux 图形库依赖
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev libwayland-dev libgtk-3-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-
-      # Linux 产物的 glibc 底线是**构建机**决定的：ubuntu-latest 现在是 Ubuntu 24.04
-      # （glibc 2.39），编出来的二进制会硬要求 GLIBC_2.39 等符号，于是
-      # CentOS/RHEL 8（2.28）、Ubuntu 22.04（2.35）这类机器上直接
-      # `GLIBC_2.xx not found` 起不来——看着像"文件坏了"，其实是构建环境太新。
-      #
-      # 用 zig 当链接器把目标钉在 **glibc 2.17**（rustc 支持的最低底线，
-      # 覆盖 CentOS/RHEL 7+、Debian 8+、Ubuntu 14.04+）。zig 自带各版本 glibc 的桩，
-      # 所以不需要一台旧机器也能编出旧 glibc 的产物。Windows / macOS 不受影响。
-      - name: 安装 zig（只有 Linux 产物需要）
-        if: runner.os == 'Linux'
-        uses: mlugg/setup-zig@v2
-        with:
-          version: "0.16.0"
-
-      - name: 安装 cargo-zigbuild
-        if: runner.os == 'Linux'
-        run: cargo install --locked cargo-zigbuild
-
       - name: 构建
-        if: runner.os != 'Linux'
         run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: 构建（Linux，glibc 钉在 2.17）
-        if: runner.os == 'Linux'
-        run: |
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.17
-          # cargo-zigbuild 会把 `.2.17` 后缀去掉，产物仍在 target/<三元组>/release/ 下。
-          # 仍用 find 兜一层：万一将来路径变了，也好过静默打包上一个旧文件。
-          BIN=$(find target -maxdepth 3 -type f -name logview -path '*/release/*' | head -1)
-          echo "zigbuild 产物：$BIN"
-          WANT=target/x86_64-unknown-linux-gnu/release/logview
-          if [ "$BIN" != "$WANT" ]; then cp "$BIN" "$WANT"; fi
-
-      # 光"钉住了"不够，还得能证明。这道检查让底线上抬时**构建失败**而不是发布出去——
-      # 新增一个用上新符号的依赖就会悄悄抬高它，而后果只在别人的旧机器上才看得到。
-      - name: 校验 Linux 产物的 glibc 需求
-        if: runner.os == 'Linux'
-        run: |
-          BIN=target/x86_64-unknown-linux-gnu/release/logview
-          test -f "$BIN" || { echo "::error::没找到 $BIN"; exit 1; }
-          # 注意去掉 GLIBC_ 前缀再排序比较：带着前缀时 'GLIBC_2.17' 会被排到 '2.17' 之后，
-          # 于是合格输入也会被判成不合格（本地干跑就是这么抓出来的）
-          REQ=$(readelf --version-info "$BIN" | grep -o 'GLIBC_[0-9.]\+' | sed 's/^GLIBC_//' | sort -Vu | tr '\n' ' ')
-          MAX=$(echo "$REQ" | tr ' ' '\n' | grep . | tail -1)
-          echo "产物要求的 glibc：$REQ"
-          echo "最高：$MAX（允许到 2.17）"
-          if [ "$(printf '%s\n2.17\n' "$MAX" | sort -V | tail -1)" != "2.17" ]; then
-            echo "::error::产物要求 glibc $MAX，高于约定的 2.17，会在旧发行版上起不来"
-            exit 1
-          fi
 
       # 压缩包名里带版本号（`logview-v0.1.9-x86_64-pc-windows-msvc.zip`）：下载到本地后
       # 堆几个版本也能一眼分清新旧。v0.1.8 及更早叫 `logview-x86_64-pc-windows-msvc.zip`，
-      # 不带版本，出现过"拿着旧包以为是最新版"的误会。所以四个平台都要读到版本号
+      # 不带版本，出现过"拿着旧包以为是最新版"的误会。所以每个目标都要读到版本号
       # （Windows 上这段由 Git Bash 执行）。
       - name: 读取版本号（并校验与标签一致）
         id: ver
@@ -125,9 +73,8 @@ jobs:
       # macOS 必须打成 .app：Finder 遇到裸二进制会交给终端执行，
       # 双击就会弹出一个终端窗口，而 Windows 靠 PE 头部标记解决这个问题。
       #
-      # 三个平台都在压缩包里套一层与压缩包同名的目录：解压不会把文件散在当前目录里，
-      # 几个版本解压到同一个下载目录也不会互相覆盖（旧版 Linux 直接摊在根上，
-      # 加了 .desktop 与 icons/ 之后尤其乱）。
+      # 两个平台都在压缩包里套一层与压缩包同名的目录：解压不会把文件散在当前目录里，
+      # 几个版本解压到同一个下载目录也不会互相覆盖。
       - name: 打包（macOS，包成 .app）
         if: runner.os == 'macOS'
         shell: bash
@@ -143,27 +90,6 @@ jobs:
           tar -czf "$NAME.tar.gz" "$NAME"
           rm -rf "$NAME"
           echo "产物大小：$(du -h "$NAME.tar.gz" | cut -f1)"
-
-      # Linux 的"程序图标"不在可执行文件里（不像 Windows 的 PE 资源、macOS 的 .app），
-      # 而是系统里的一份独立文件：`.desktop` 启动项 + hicolor 主题下的 PNG。
-      # 所以这两样得跟着产物一起发，否则只有运行时的窗口图标（X11 下走 _NET_WM_ICON），
-      # 而 Wayland 下合成器要靠 .desktop 匹配 app_id，缺了它就是默认图标。
-      - name: 打包（Linux）
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          NAME="logview-v${{ steps.ver.outputs.value }}-${{ matrix.target }}"
-          STAGE=$(mktemp -d)
-          DEST="$STAGE/$NAME"
-          install -Dm755 target/${{ matrix.target }}/release/logview "$DEST/logview"
-          install -Dm644 assets/logview.desktop "$DEST/logview.desktop"
-          for s in 16 32 64 128 256 512; do
-            install -Dm644 "assets/icon-$s.png" \
-              "$DEST/icons/hicolor/${s}x${s}/apps/logview.png"
-          done
-          tar -czf "$NAME.tar.gz" -C "$STAGE" "$NAME"
-          echo "产物大小：$(du -h "$NAME.tar.gz" | cut -f1)"
-          tar -tzf "$NAME.tar.gz" | sed 's/^/  /'
 
       - name: 打包（Windows）
         if: runner.os == 'Windows'
