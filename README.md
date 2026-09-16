@@ -103,15 +103,19 @@ WARN / ERROR 的行会在最左侧挂一条色条（上图用 `▌` 表示），
 
 | 文件 | 平台 |
 |---|---|
-| `logview-v0.1.10-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
-| `logview-v0.1.10-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
-| `logview-v0.1.10-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
-| `logview-v0.1.10-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `logview-v0.1.12-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `logview-v0.1.12-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+| `logview-v0.1.12-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
 
 文件名里的版本号与 Release 标签一致，下载到本地堆几个版本也不会混淆
 （v0.1.8 及更早的包名不带版本号）。**v0.1.10 起**每个压缩包解压后都是**与压缩包同名的一层目录**，
 可执行文件在这一层的根部（macOS 是 `logview.app`），
 所以把几个版本解压到同一个目录也不会互相覆盖。
+
+> **Linux 暂时没有预编译产物**（v0.1.12 起撤下）。前几版都卡在图形这一层：那台机器上
+> X11 的 GLX 与 wgpu 的 EGL/Vulkan 都没能起来（详见下面「Linux 上的图形环境」），
+> 与其让你下载一个打不开的包，不如先不发。代码本身仍然支持 Linux——CI 三个平台
+> 一直在编译与跑测试——需要的话照[从源码构建](#从源码构建)自己编一份。
 
 macOS 的 `logview.app` **双击即可运行**——不是裸二进制，
 所以不会弹出终端窗口。若想在终端里使用，执行
@@ -121,19 +125,23 @@ macOS 的 `logview.app` **双击即可运行**——不是裸二进制，
 
 ```bash
 shasum -a 256 -c SHA256SUMS.txt        # macOS
-sha256sum -c SHA256SUMS.txt            # Linux
+sha256sum -c SHA256SUMS.txt            # Linux / 其他有 GNU coreutils 的系统
 ```
 
 Windows 需要 [VC++ 2015-2022 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 （绝大多数机器已预装；缺失时 Windows 会提示缺少 `VCRUNTIME140.dll`）。
 
-Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.04+ 都满足）。
-发布流程用 [zig](https://ziglang.org/) 当链接器把这个底线钉死，否则默认构建机
-（Ubuntu 24.04，glibc 2.39）编出来的产物会在 CentOS 8、Ubuntu 22.04 这类机器上报
-`GLIBC_2.34 not found` —— 看着像文件坏了，其实是构建环境太新。产物只硬依赖
-`libc` / `libm` / `libgcc_s`，X11、Wayland、OpenGL 都是**运行时**动态加载的。
+自己构建 Linux 产物的话，注意二进制的 glibc 底线是**构建机**决定的：在 Ubuntu 24.04
+（glibc 2.39）上编出来的东西拿到 CentOS/RHEL 8（2.28）上会报 `GLIBC_2.xx not found`，
+看着像文件坏了，其实是构建环境太新。要在老机器上跑，要么在目标机器上构建，要么用 zig
+把底线钉住：
 
-> **Linux 上需要图形环境。** 这是 GUI 程序：进程能起来，但要弹出窗口得有 X11 或 Wayland
+```bash
+cargo install --locked cargo-zigbuild
+cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17    # 需先装 zig
+```
+
+> **Linux 上的图形环境。** 这是 GUI 程序：进程能起来，但要弹出窗口得有 X11 或 Wayland
 > （纯 SSH 终端里跑不了，远程看建议在本地或远程桌面上开 Windows 版）。
 > 起不来时原因会打到 stderr，终端里能看到。
 >
@@ -141,17 +149,16 @@ Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.0
 > eframe 固定"先试 GLX，失败才退 EGL"，且没有环境变量可改；而远程 X 会话（VNC、远程控制台）
 > 上 GLX 建上下文会失败，报出来的却是随后的
 > `XError { description: "GLXBadContextTag" }`——一个异步投递的错误，最后从 winit 里
-> panic 出来，连位置都是错的。wgpu 那条路完全不碰 GLX，绕开了这一整类问题。
+> panic 出来，连位置都是错的。wgpu 那条路完全不碰 GLX，但**同样需要机器上有可用的
+> Vulkan 或 EGL**，否则也起不来——这也是 Linux 预编译包暂时撤下的原因。
 >
-> 万一仍然打不开，依次试（都会把实际用的后端打到 stderr）：
+> 起不来时先看这两行（启动就打在 stderr），再做取舍：
 >
 > ```bash
 > LOGVIEW_RENDERER=glow ./logview                        # 换回 OpenGL / GLX
 > LOGVIEW_RENDERER=wgpu WGPU_BACKEND=gl ./logview        # 限定 wgpu 走 EGL
 > LOGVIEW_RENDERER=wgpu WGPU_BACKEND=vulkan ./logview    # 限定 wgpu 走 Vulkan
 > ```
->
-> 启动时会打印两行，出问题时一起贴出来就够定位：
 >
 > ```
 > [logview] 渲染后端 = wgpu（平台默认）
@@ -162,16 +169,20 @@ Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.0
 > 写错不会报错，而是变成"一个后端都没有"，所以那一行也一并打出来。
 > macOS 的产物里没有编进 wgpu，指定它会被忽略并回退到 glow。
 
-想让它出现在应用菜单里、并带上自己的图标，把压缩包里的 `.desktop` 与 `icons/` 装到用户目录：
+从源码在 Linux 上跑时，想让它出现在应用菜单里、并带上自己的图标，装这三样
+（后两样在仓库的 `assets/` 里）：
 
 ```bash
-install -Dm755 logview ~/.local/bin/logview
-install -Dm644 logview.desktop ~/.local/share/applications/logview.desktop
-cp -r icons/* ~/.local/share/icons/
+install -Dm755 target/release/logview ~/.local/bin/logview
+install -Dm644 assets/logview.desktop ~/.local/share/applications/logview.desktop
+for s in 16 32 64 128 256 512; do
+  install -Dm644 "assets/icon-$s.png" \
+    "$HOME/.local/share/icons/hicolor/${s}x${s}/apps/logview.png"
+done
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 ```
 
-`icons/` 是 hicolor 主题的标准尺寸（16 / 32 / 64 / 128 / 256 / 512）。
+`assets/icon-*.png` 是 hicolor 主题的标准尺寸（16 / 32 / 64 / 128 / 256 / 512）。
 **图标为什么要在外面装**：Linux 不像 Windows 把图标嵌进可执行文件，也不像 macOS 打进 `.app`——
 窗口图标是运行时设的（X11 下走 `_NET_WM_ICON`，不装也能看到），
 而 **Wayland 下合成器要靠 `.desktop` 把窗口与图标对上**，不装就只有默认图标。
@@ -347,15 +358,22 @@ PE 资源是通过 MSVC 链接器认识的 `.res` 送入的，这条路径只覆
 ## 发布流程
 
 推送以 `v` 开头的标签即可触发 [`.github/workflows/release.yml`](.github/workflows/release.yml)，
-自动构建四个平台的产物、生成 SHA256 校验和并创建 GitHub Release：
+自动构建 macOS（两种架构）与 Windows 的产物、生成 SHA256 校验和并创建 GitHub Release：
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
+标签必须与 `Cargo.toml` 里的版本一致，否则工作流会直接失败——包名里带着版本号，
+两者不一致比不带版本更误导。Linux 目前是"自行构建"的定位（见上面的说明），
+所以发布矩阵里没有它；[CI](.github/workflows/ci.yml) 仍然在三个平台上跑格式、Clippy、
+测试与构建。
+
 ## 已知限制
 
+- **Linux 暂无预编译产物**（v0.1.12 起）。代码支持 Linux、CI 也在测，但几台远程 X 会话的机器上
+  GLX 与 EGL 都没能把窗口建起来，没确认可用之前不发这种包。需要就自己构建（见[安装](#安装)）。
 - **仅支持 UTF-8 与 GB18030**。UTF-16 编码的日志会按 GB18030 解码而产生乱码，
   如需支持可增加 BOM 判定分支。
 - **索引占用内存**。行偏移数组按每行 8 字节计算，1 GB、平均行宽 50 字节的日志
