@@ -47,7 +47,7 @@
 | 过滤视图 | 仅显示匹配行，可作为交互式 `grep` 使用 |
 | 行首识别 | 解析行首的时间戳与级别：日期淡出、时间弱化；WARN / ERROR 另带左侧色条与底色标签 |
 | 编码自适应 | 优先 UTF-8，失败时回退 GB18030，Windows 中文环境的 GBK 日志不会乱码 |
-| 中文字体 | 按平台自动探测并加载系统 CJK 字体 |
+| 中文字体 | 自动探测并加载系统 CJK 字体（标准路径没命中时扫字体目录） |
 | 界面 | 主题三态切换（跟随系统 / 浅色 / 深色），支持拖拽文件打开与命令行参数 |
 
 界面组成：
@@ -137,15 +137,29 @@ Linux 产物要求 **glibc ≥ 2.17**（CentOS/RHEL 7+、Debian 8+、Ubuntu 14.0
 > （纯 SSH 终端里跑不了，远程看建议在本地或远程桌面上开 Windows 版）。
 > 起不来时原因会打到 stderr，终端里能看到。
 >
-> **窗口起不来时，换个渲染后端再试一次。** X11 下的 GL 实现不由程序决定 —— eframe 固定
-> "GLX 优先，失败才退 EGL"，且没有环境变量可改；而某些远程 X 会话（VNC、远程控制台）的
-> GLX 会让它崩在 `GLXBadContextTag` 上。这时换成 wgpu 就绕开了（wgpu 走 Vulkan 或 EGL，
-> 完全不碰 GLX）：
+> **Linux 默认走 wgpu**（Vulkan 或 EGL），不是 OpenGL。原因是 X11 下的 GL 实现不由程序决定：
+> eframe 固定"先试 GLX，失败才退 EGL"，且没有环境变量可改；而远程 X 会话（VNC、远程控制台）
+> 上 GLX 建上下文会失败，报出来的却是随后的
+> `XError { description: "GLXBadContextTag" }`——一个异步投递的错误，最后从 winit 里
+> panic 出来，连位置都是错的。wgpu 那条路完全不碰 GLX，绕开了这一整类问题。
+>
+> 万一仍然打不开，依次试（都会把实际用的后端打到 stderr）：
 >
 > ```bash
-> LOGVIEW_RENDERER=wgpu ./logview     # 换回 OpenGL 就是 LOGVIEW_RENDERER=glow
+> LOGVIEW_RENDERER=glow ./logview                        # 换回 OpenGL / GLX
+> LOGVIEW_RENDERER=wgpu WGPU_BACKEND=gl ./logview        # 限定 wgpu 走 EGL
+> LOGVIEW_RENDERER=wgpu WGPU_BACKEND=vulkan ./logview    # 限定 wgpu 走 Vulkan
 > ```
 >
+> 启动时会打印两行，出问题时一起贴出来就够定位：
+>
+> ```
+> [logview] 渲染后端 = wgpu（平台默认）
+> [logview] 图形适配器 = Gl / llvmpipe (LLVM 10.0.1, 256 bits)（Cpu）
+> ```
+>
+> `WGPU_BACKEND` 的取值是 `gl` / `vulkan` / `dx12` 这类小写名字（可逗号分隔）；
+> 写错不会报错，而是变成"一个后端都没有"，所以那一行也一并打出来。
 > macOS 的产物里没有编进 wgpu，指定它会被忽略并回退到 glow。
 
 想让它出现在应用菜单里、并带上自己的图标，把压缩包里的 `.desktop` 与 `icons/` 装到用户目录：
@@ -162,8 +176,12 @@ update-desktop-database ~/.local/share/applications 2>/dev/null || true
 窗口图标是运行时设的（X11 下走 `_NET_WM_ICON`，不装也能看到），
 而 **Wayland 下合成器要靠 `.desktop` 把窗口与图标对上**，不装就只有默认图标。
 
-渲染走 **D3D12**（wgpu），远程桌面会话、虚拟机与没装显卡驱动的机器上都能正常打开；
-没有硬件显卡时会回退到软件渲染（WARP），界面能用但滚动会慢一些。
+> **中文字体。** 系统里一个 CJK 字体都没有时，界面中文会显示成方框——程序会就此打一行
+> 提示（Linux 上尤其常见，最小化安装的服务器通常不带）。装一个即可：
+> `yum install wqy-zenhei-fonts`（CentOS/RHEL）或 `apt install fonts-wqy-zenhei`（Debian/Ubuntu）。
+
+渲染走 **wgpu**：优先 Vulkan，远程桌面里没有 Vulkan 时回退 **D3D12**，再不行还能退回软件
+渲染（WARP），所以远程桌面会话、虚拟机与没装显卡驱动的机器上都能正常打开。
 不用 OpenGL 是因为远程桌面的显示驱动往往只提供 OpenGL 1.1，那种环境下 OpenGL
 后端根本建不起窗口——而"在服务器上看日志"恰恰是这类工具的常见用法。
 万一窗口仍然起不来，程序会弹出对话框说明原因（release 没有 stderr，不弹就只能看到
@@ -278,7 +296,7 @@ Windows 与 Linux 上 `⌘` 对应 `Ctrl`。
 | `src/logstore.rs` | 内存映射、行偏移索引、增量索引线程、文件变更检测、编码判定与按行解码、后台检索 |
 | `src/app.rs` | egui 界面：虚拟滚动列表、检索高亮、级别着色、工具栏与状态栏 |
 | `src/fonts.rs` | 按平台探测并加载系统 CJK 字体 |
-| `src/main.rs` | 程序入口、命令行参数、release 下的图形子系统与 panic 对话框 |
+| `src/main.rs` | 程序入口、命令行参数、渲染后端选择、release 下的图形子系统与 panic 对话框 |
 | `build.rs` | 构建脚本：Windows 下把 `assets/icon.rc` 编译成 PE 资源链接进 exe |
 | `assets/` | 图标素材；`icon.ico` 供资源编译，`icon-128.rgba` 供运行时窗口图标 |
 | `tests/store_test.rs` | 集成测试，覆盖编码判定、索引、检索、文件增长与轮转 |

@@ -45,13 +45,19 @@ eframe = { version = "0.31", default-features = false, features = [
 ] }
 wgpu = { version = "24", default-features = false, features = ["dx12", "wgsl"] }
 
-# Linux：默认仍然是 glow，但**同时编进 wgpu**，可用 LOGVIEW_RENDERER=wgpu 切换。
+# Linux：两个后端都编，**默认走 wgpu**（可用 LOGVIEW_RENDERER=glow 换回 OpenGL）。
 #
-# 原因是 X11 下的 GL 实现不由我们决定：eframe 写死了 "GLX 优先，失败才退 EGL"
-# （glutin-winit 的 ApiPreference::FallbackEgl），且没有环境变量可改。
-# 而某些远程 X 会话（VNC / 远程控制台）的 GLX 会让 glutin 崩在 GLXBadContextTag 上——
-# 那时换 wgpu 走 Vulkan 或 **EGL**，完全不碰 GLX，是另一条独立的路。
-# 代价是 Linux 产物多几 MB；正常桌面上 glow 一直好好的，所以默认不动它。
+# 原因与 Windows 那条同源：X11 下的 GL 实现不由我们决定。eframe 写死了
+# "先试 GLX，失败才退 EGL"（glutin-winit 的 ApiPreference::FallbackEgl），
+# 没有环境变量可改。而 GLX 建上下文失败时 glutin 只认服务端返回的 XID，
+# 照样当成成功，直到随后的 glXMakeCurrent 才被 X 服务器回 GLXBadContextTag——
+# 这个错误是异步投递的，最后被 winit 报成一个来自 XMapRaised 的 panic，
+# 还会在 drop 里二次 panic 把进程 abort 掉。远程 X（VNC、远程控制台）上很容易踩到。
+# wgpu 在 Linux 走 Vulkan 或 **EGL**，整个 GLES 后端里没有一处 GLX 调用，正好绕开。
+# 代价是 Linux 产物多几 MB（实测 15.6 → 20.1 MB）。
+#
+# 注意 winit 不允许重建 event loop（第二次创建直接返回 RecreationAttempt），
+# 所以做不到"一个后端失败再试另一个"——默认值必须一次选对。
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.31", default-features = false, features = [
     "accesskit",
