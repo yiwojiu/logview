@@ -7,12 +7,12 @@
 [![CI](https://github.com/yiwojiu/logview/actions/workflows/ci.yml/badge.svg)](https://github.com/yiwojiu/logview/actions/workflows/ci.yml)
 [![Release](https://github.com/yiwojiu/logview/actions/workflows/release.yml/badge.svg)](https://github.com/yiwojiu/logview/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg)](#安装)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)](#安装)
 
 > Cross-platform desktop viewer for very large log files, built with Rust and egui.
 > Opens 200 MB / 1.6 M-line files instantly and never loads the whole file into memory.
 
-跨平台大日志查看器，基于 Rust 与 egui 实现，macOS / Windows / Linux 共用同一套代码。
+跨平台大日志查看器，基于 Rust 与 egui 实现，macOS 与 Windows 共用同一套代码。
 
 目标场景是几百 MB 量级的服务端日志：用文本编辑器打开需要漫长等待甚至直接卡死，
 而 `grep` 又看不到上下文。本项目通过内存映射与行偏移索引，使这类文件的打开、
@@ -47,7 +47,7 @@
 | 过滤视图 | 仅显示匹配行，可作为交互式 `grep` 使用 |
 | 行首识别 | 解析行首的时间戳与级别：日期淡出、时间弱化；WARN / ERROR 另带左侧色条与底色标签 |
 | 编码自适应 | 优先 UTF-8，失败时回退 GB18030，Windows 中文环境的 GBK 日志不会乱码 |
-| 中文字体 | 自动探测并加载系统 CJK 字体（标准路径没命中时扫字体目录） |
+| 中文字体 | 自动探测并加载系统 CJK 字体 |
 | 界面 | 主题三态切换（跟随系统 / 浅色 / 深色），支持拖拽文件打开与命令行参数 |
 
 界面组成：
@@ -103,98 +103,37 @@ WARN / ERROR 的行会在最左侧挂一条色条（上图用 `▌` 表示），
 
 | 文件 | 平台 |
 |---|---|
-| `logview-v0.1.12-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
-| `logview-v0.1.12-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
-| `logview-v0.1.12-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
+| `logview-v0.1.13-aarch64-apple-darwin.tar.gz` | macOS（Apple Silicon） |
+| `logview-v0.1.13-x86_64-apple-darwin.tar.gz` | macOS（Intel） |
+| `logview-v0.1.13-x86_64-pc-windows-msvc.zip` | Windows x86_64 |
 
 文件名里的版本号与 Release 标签一致，下载到本地堆几个版本也不会混淆
 （v0.1.8 及更早的包名不带版本号）。**v0.1.10 起**每个压缩包解压后都是**与压缩包同名的一层目录**，
 可执行文件在这一层的根部（macOS 是 `logview.app`），
 所以把几个版本解压到同一个目录也不会互相覆盖。
 
-> **Linux 暂时没有预编译产物**（v0.1.12 起撤下）。前几版都卡在图形这一层：那台机器上
-> X11 的 GLX 与 wgpu 的 EGL/Vulkan 都没能起来（详见下面「Linux 上的图形环境」），
-> 与其让你下载一个打不开的包，不如先不发。代码本身仍然支持 Linux——CI 三个平台
-> 一直在编译与跑测试——需要的话照[从源码构建](#从源码构建)自己编一份。
-
 macOS 的 `logview.app` **双击即可运行**——不是裸二进制，
 所以不会弹出终端窗口。若想在终端里使用，执行
 `logview.app/Contents/MacOS/logview`。
+
+Windows 的 exe 带版本信息，右键「属性 → 详细信息」能看到版本号与产品名——
+文件名之外多一处可核对的地方。
 
 发布页附带 `SHA256SUMS.txt`，可用于校验文件完整性：
 
 ```bash
 shasum -a 256 -c SHA256SUMS.txt        # macOS
-sha256sum -c SHA256SUMS.txt            # Linux / 其他有 GNU coreutils 的系统
+certutil -hashfile <文件名> SHA256      # Windows
 ```
 
 Windows 需要 [VC++ 2015-2022 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 （绝大多数机器已预装；缺失时 Windows 会提示缺少 `VCRUNTIME140.dll`）。
 
-自己构建 Linux 产物的话，注意二进制的 glibc 底线是**构建机**决定的：在 Ubuntu 24.04
-（glibc 2.39）上编出来的东西拿到 CentOS/RHEL 8（2.28）上会报 `GLIBC_2.xx not found`，
-看着像文件坏了，其实是构建环境太新。要在老机器上跑，要么在目标机器上构建，要么用 zig
-把底线钉住：
-
-```bash
-cargo install --locked cargo-zigbuild
-cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17    # 需先装 zig
-```
-
-> **Linux 上的图形环境。** 这是 GUI 程序：进程能起来，但要弹出窗口得有 X11 或 Wayland
-> （纯 SSH 终端里跑不了，远程看建议在本地或远程桌面上开 Windows 版）。
-> 起不来时原因会打到 stderr，终端里能看到。
->
-> **Linux 默认走 wgpu**（Vulkan 或 EGL），不是 OpenGL。原因是 X11 下的 GL 实现不由程序决定：
-> eframe 固定"先试 GLX，失败才退 EGL"，且没有环境变量可改；而远程 X 会话（VNC、远程控制台）
-> 上 GLX 建上下文会失败，报出来的却是随后的
-> `XError { description: "GLXBadContextTag" }`——一个异步投递的错误，最后从 winit 里
-> panic 出来，连位置都是错的。wgpu 那条路完全不碰 GLX，但**同样需要机器上有可用的
-> Vulkan 或 EGL**，否则也起不来——这也是 Linux 预编译包暂时撤下的原因。
->
-> 起不来时先看这两行（启动就打在 stderr），再做取舍：
->
-> ```bash
-> LOGVIEW_RENDERER=glow ./logview                        # 换回 OpenGL / GLX
-> LOGVIEW_RENDERER=wgpu WGPU_BACKEND=gl ./logview        # 限定 wgpu 走 EGL
-> LOGVIEW_RENDERER=wgpu WGPU_BACKEND=vulkan ./logview    # 限定 wgpu 走 Vulkan
-> ```
->
-> ```
-> [logview] 渲染后端 = wgpu（平台默认）
-> [logview] 图形适配器 = Gl / llvmpipe (LLVM 10.0.1, 256 bits)（Cpu）
-> ```
->
-> `WGPU_BACKEND` 的取值是 `gl` / `vulkan` / `dx12` 这类小写名字（可逗号分隔）；
-> 写错不会报错，而是变成"一个后端都没有"，所以那一行也一并打出来。
-> macOS 的产物里没有编进 wgpu，指定它会被忽略并回退到 glow。
-
-从源码在 Linux 上跑时，想让它出现在应用菜单里、并带上自己的图标，装这三样
-（后两样在仓库的 `assets/` 里）：
-
-```bash
-install -Dm755 target/release/logview ~/.local/bin/logview
-install -Dm644 assets/logview.desktop ~/.local/share/applications/logview.desktop
-for s in 16 32 64 128 256 512; do
-  install -Dm644 "assets/icon-$s.png" \
-    "$HOME/.local/share/icons/hicolor/${s}x${s}/apps/logview.png"
-done
-update-desktop-database ~/.local/share/applications 2>/dev/null || true
-```
-
-`assets/icon-*.png` 是 hicolor 主题的标准尺寸（16 / 32 / 64 / 128 / 256 / 512）。
-**图标为什么要在外面装**：Linux 不像 Windows 把图标嵌进可执行文件，也不像 macOS 打进 `.app`——
-窗口图标是运行时设的（X11 下走 `_NET_WM_ICON`，不装也能看到），
-而 **Wayland 下合成器要靠 `.desktop` 把窗口与图标对上**，不装就只有默认图标。
-
-> **中文字体。** 系统里一个 CJK 字体都没有时，界面中文会显示成方框——程序会就此打一行
-> 提示（Linux 上尤其常见，最小化安装的服务器通常不带）。装一个即可：
-> `yum install wqy-zenhei-fonts`（CentOS/RHEL）或 `apt install fonts-wqy-zenhei`（Debian/Ubuntu）。
-
 渲染走 **wgpu**：优先 Vulkan，远程桌面里没有 Vulkan 时回退 **D3D12**，再不行还能退回软件
 渲染（WARP），所以远程桌面会话、虚拟机与没装显卡驱动的机器上都能正常打开。
 不用 OpenGL 是因为远程桌面的显示驱动往往只提供 OpenGL 1.1，那种环境下 OpenGL
 后端根本建不起窗口——而"在服务器上看日志"恰恰是这类工具的常见用法。
+macOS 上则用 OpenGL，那边一直正常，没必要多背几 MB。
 万一窗口仍然起不来，程序会弹出对话框说明原因（release 没有 stderr，不弹就只能看到
 「双击没反应」）。
 
@@ -219,9 +158,16 @@ cargo build --release
 
 产物位于 `target/release/logview`，Windows 下为 `logview.exe`。
 
-Windows 的 exe 文件图标由 `build.rs` 处理：它把 `assets/icon.rc` 编译成 PE 资源再交给链接器。
+Windows 的 exe 资源由 `build.rs` 处理：它把 `assets/icon.rc` 编译成 PE 资源再交给链接器，
+里面是两样东西——**图标**（资源管理器里看到的）与**版本信息**（「属性 → 详细信息」里的版本号）。
+版本号取自 `Cargo.toml`，由 `build.rs` 生成头文件喂给 `rc.exe`，所以发版时不需要手动同步。
 资源编译器 `rc.exe` 依次从 `RC` 环境变量、Windows SDK 安装目录、`PATH` 中查找；三者都没有时
-只打印一条警告并跳过，不会中断构建，产物退化为系统默认图标。其他平台不需要这一步。
+只打印一条警告并跳过，不会中断构建，产物退化为系统默认图标、也没有版本信息。
+其他平台不需要这一步。
+
+> 改 `assets/icon.rc` 时**保持文件为纯 ASCII，注释也用英文**。`rc.exe` 对没有 BOM 的源文件
+> 按 ANSI 代码页解读，中文注释可能把紧跟的一行吃掉——症状是 `RC2104: undefined keyword or
+> key name: VER_MAJOR` 这种看不出所以然的报错。中文说明写到 `build.rs` 里。
 
 > 运行时窗口与任务栏的图标走的是另一条路径（`ViewportBuilder::with_icon` + `assets/icon-128.rgba`），
 > 两者互不替代：只有后者时，窗口内看起来正常，但资源管理器里的 exe 仍是系统默认图标。
@@ -270,7 +216,7 @@ logview /var/log/app.log         # 直接打开指定文件
 行内文字也可以像文本编辑器那样拖拽划选，再用 `⌘C` 复制。
 
 裸字母键仅在搜索框未获得焦点时才作为快捷键，所以在搜索框内可以正常输入 `n`、`g` 等字符。
-Windows 与 Linux 上 `⌘` 对应 `Ctrl`。
+Windows 上 `⌘` 对应 `Ctrl`。
 
 ## 设计要点
 
@@ -308,7 +254,7 @@ Windows 与 Linux 上 `⌘` 对应 `Ctrl`。
 | `src/app.rs` | egui 界面：虚拟滚动列表、检索高亮、级别着色、工具栏与状态栏 |
 | `src/fonts.rs` | 按平台探测并加载系统 CJK 字体 |
 | `src/main.rs` | 程序入口、命令行参数、渲染后端选择、release 下的图形子系统与 panic 对话框 |
-| `build.rs` | 构建脚本：Windows 下把 `assets/icon.rc` 编译成 PE 资源链接进 exe |
+| `build.rs` | 构建脚本：Windows 下把 `assets/icon.rc`（图标 + 版本信息）编译成 PE 资源链接进 exe |
 | `assets/` | 图标素材；`icon.ico` 供资源编译，`icon-128.rgba` 供运行时窗口图标 |
 | `tests/store_test.rs` | 集成测试，覆盖编码判定、索引、检索、文件增长与轮转 |
 | `examples/bench.rs` | 大文件压力测试，输出打开 / 索引 / 检索耗时 |
@@ -330,8 +276,8 @@ cargo run --example fontcheck
 cargo run --release --example bench /tmp/bench.log 200
 ```
 
-CI 在 ubuntu / macos / windows 三个平台执行格式检查、Clippy、测试与构建，
-配置见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
+CI 在 macOS、Windows 与 Linux 三个平台执行格式检查、Clippy、测试与构建（Linux 仅用于
+确认代码仍可构建，不发布产物），配置见 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)。
 
 ## 跨平台构建
 
@@ -343,11 +289,6 @@ cargo build --release
 rustup target add x86_64-pc-windows-gnu
 brew install mingw-w64
 cargo build --release --target x86_64-pc-windows-gnu
-
-# macOS 交叉编译 Linux（musl 静态链接）
-rustup target add x86_64-unknown-linux-musl
-brew install FiloSottile/musl-cross/musl-cross
-cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 产物位于 `target/<target>/release/`。
@@ -366,14 +307,10 @@ git push origin v0.1.0
 ```
 
 标签必须与 `Cargo.toml` 里的版本一致，否则工作流会直接失败——包名里带着版本号，
-两者不一致比不带版本更误导。Linux 目前是"自行构建"的定位（见上面的说明），
-所以发布矩阵里没有它；[CI](.github/workflows/ci.yml) 仍然在三个平台上跑格式、Clippy、
-测试与构建。
+两者不一致比不带版本更误导。
 
 ## 已知限制
 
-- **Linux 暂无预编译产物**（v0.1.12 起）。代码支持 Linux、CI 也在测，但几台远程 X 会话的机器上
-  GLX 与 EGL 都没能把窗口建起来，没确认可用之前不发这种包。需要就自己构建（见[安装](#安装)）。
 - **仅支持 UTF-8 与 GB18030**。UTF-16 编码的日志会按 GB18030 解码而产生乱码，
   如需支持可增加 BOM 判定分支。
 - **索引占用内存**。行偏移数组按每行 8 字节计算，1 GB、平均行宽 50 字节的日志
