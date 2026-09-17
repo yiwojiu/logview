@@ -1,6 +1,8 @@
+use crate::bookmarks::{self, Bookmark};
 use crate::logstore::{encoding_name, LogStore, SearchRequest};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextStyle};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -69,8 +71,78 @@ pub struct LogViewApp {
     /// 请求跳到文件末尾（需在得知总行数后处理）
     jump_to_end: bool,
 
+    /// 标记（书签）。锚点是字节偏移 + 内容指纹，见 `bookmarks` 模块
+    marks: Vec<Mark>,
+    /// 侧车文件的路径。日志目录不可写时为 None——那时标记只存在于本次会话
+    marks_path: Option<PathBuf>,
+    /// 有改动待写盘（改动即写，不做"保存"按钮）
+    marks_dirty: bool,
+    /// 写侧车失败的原因，显示在面板脚上；不弹窗，因为标记本身还能用
+    marks_warning: Option<String>,
+    /// 标记面板是否展开
+    show_marks: bool,
+    /// 正在编辑备注的那条标记（按偏移定位）；Some 期间快捷键整体让位给输入框
+    editing_note: Option<u64>,
+    /// 备注编辑框的内容
+    note_buf: String,
+    /// "当前行"：标记与跳转的目标。取最近一次定位落点，没有就取视口第一行
+    cursor_line: Option<usize>,
+    /// 视口能装下多少行（由 log_area 每帧记录）：判断"当前行还看不看得见"要用它
+    visible_rows: usize,
+    /// 状态栏上的一次性提示（标记了第几行之类），几秒后自己消失
+    flash: Option<(String, Instant)>,
+
     last_refresh: Instant,
     buf: String,
+}
+
+/// 一条标记加上它此刻的定位状态。
+///
+/// 状态是**加载时按指纹现算的**，不存进侧车文件：文件随时可能被轮转、被追加，
+/// 存下来的"当时对不对"没有任何意义。
+#[derive(Clone, Debug)]
+struct Mark {
+    bm: Bookmark,
+    anchor: AnchorState,
+}
+
+/// 锚点此刻是否还对得上
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AnchorState {
+    /// 指纹一致，可以直接跳过去
+    Fresh,
+    /// 偏移处的内容变了：不跳，避免静默落在错的行上
+    Stale,
+    /// 偏移已经超出文件长度（文件变小了）
+    Lost,
+}
+
+/// 标记面板上能触发的动作。
+///
+/// 收集起来等 UI 走完再执行：面板上每个动作都要改 `self`，而 UI 闭包同时还在读
+/// `self` 的别的字段，直接写会绕进借用冲突。
+#[derive(Clone, Copy)]
+enum MarkAct {
+    Goto(u64),
+    Delete(u64),
+    StartNote(u64),
+    CommitNote,
+    RefindAll,
+    DropStale,
+    Export,
+    Hide,
+}
+
+/// 面板上一条标记要显示的内容。先算好成一份只读快照，UI 里就只管画。
+struct MarkRow {
+    offset: u64,
+    /// 现在落在第几行；索引还没覆盖到那个位置时为 None
+    line: Option<usize>,
+    head: String,
+    note: String,
+    /// 标记时间，显示成"3 天前"
+    time: String,
+    state: AnchorState,
 }
 
 impl Default for LogViewApp {
@@ -95,6 +167,16 @@ impl Default for LogViewApp {
             search_has_focus: false,
             focus_search: false,
             jump_to_end: false,
+            marks: Vec::new(),
+            marks_path: None,
+            marks_dirty: false,
+            marks_warning: None,
+            show_marks: false,
+            editing_note: None,
+            note_buf: String::new(),
+            cursor_line: None,
+            visible_rows: 1,
+            flash: None,
             last_refresh: Instant::now(),
             buf: String::with_capacity(1024),
         }
@@ -117,6 +199,8 @@ impl LogViewApp {
                 self.match_cursor = 0;
                 self.store = Some(s);
                 self.error = None;
+                // store 就位之后才能按指纹核对侧车里的标记
+                self.load_marks();
             }
             Err(e) => self.error = Some(format!("{e}")),
         }
@@ -224,6 +308,8 @@ impl LogViewApp {
         let cur = cur.clamp(0, n as isize - 1) as usize;
         self.match_cursor = cur;
         let line = s.matches()[cur] as usize;
+        // 跳到哪里，"当前行"就在哪里：于是跳完直接按 b 标的就是这一行
+        self.cursor_line = Some(line);
         if self.only_matched {
             self.pending_jump = Some(cur);
         } else {
@@ -237,6 +323,538 @@ impl LogViewApp {
         self.pending_jump = Some(idx);
     }
 
+    // ── 标记（书签） ───────────────────────────────────────────────
+    //
+    // 锚点怎么存、侧车什么格式、失效怎么判，都在 `bookmarks` 模块里；
+    // 这里只管交互与呈现。一条原则贯穿始终：**绝不静默跳到错的行上**——
+    // 指纹对不上就标成失效并且不跳，同时给出"按原文回找"这个补救动作。
+
+    /// 标记/跳转的目标行。
+    ///
+    /// 光标还在屏幕里就用它（"搜索跳转 → 按 b 标下这条"是最常见的用法），
+    /// 否则用视口第一行。**不能无条件信任光标**：搜到一处、又往下翻了 20 屏之后
+    /// 按 b，如果还标在那个看不见的旧位置上，用户只会觉得"按了没反应"。
+    /// 两者都是**文件行号**（过滤视图下 log_area 已把列表位置换算回来了）。
+    fn mark_target(&self) -> Option<usize> {
+        self.store.as_ref()?;
+        let top = self.top_line;
+        let bottom = top + self.visible_rows.max(1);
+        match self.cursor_line {
+            Some(line) if line >= top && line < bottom => Some(line),
+            _ => Some(top),
+        }
+    }
+
+    /// 这条标记现在落在第几行。索引还没覆盖到时退回记录时的行号——可能已经漂了，
+    /// 但比"没有行号"强。
+    fn mark_line(&self, m: &Mark) -> usize {
+        self.store
+            .as_ref()
+            .and_then(|s| s.line_index_at(m.bm.offset as usize))
+            .unwrap_or(m.bm.line as usize)
+    }
+
+    /// 状态栏上的一次性提示
+    fn flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now()));
+    }
+
+    /// `b`：标记 / 取消当前行
+    fn toggle_mark(&mut self) {
+        let Some(line) = self.mark_target() else {
+            return;
+        };
+
+        // 先把要用的数据取出来，再改 self——否则 &self.store 与 &mut self.marks 打架
+        let prepared = {
+            let Some(s) = &self.store else { return };
+            match s.line_offset(line) {
+                Some(offset) => {
+                    let mut buf = String::new();
+                    if s.read_line_into(line, &mut buf) {
+                        Some((offset, buf))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        let Some((offset, text)) = prepared else {
+            self.flash("这一行还没进索引，稍后再试");
+            return;
+        };
+
+        match self
+            .marks
+            .iter()
+            .position(|m| m.bm.offset as usize == offset)
+        {
+            Some(pos) => {
+                self.marks.remove(pos);
+                self.marks_dirty = true;
+                self.flash(format!("已取消第 {} 行的标记", line + 1));
+            }
+            None => {
+                self.marks.push(Mark {
+                    bm: Bookmark::new(offset, line, &text, bookmarks::now_secs()),
+                    anchor: AnchorState::Fresh,
+                });
+                self.marks.sort_by_key(|m| m.bm.offset);
+                self.marks_dirty = true;
+                self.cursor_line = Some(line);
+                let n = self.marks.len();
+                self.flash(format!("已标记第 {} 行（共 {n} 条）", line + 1));
+            }
+        }
+    }
+
+    /// 打开文件时把侧车里的标记读回来，并按当前内容校验每条锚点。
+    fn load_marks(&mut self) {
+        self.marks.clear();
+        self.marks_warning = None;
+        self.editing_note = None;
+        self.cursor_line = None;
+        self.marks_dirty = false;
+
+        let Some(path) = self
+            .store
+            .as_ref()
+            .map(|s| bookmarks::sidecar_path(&s.path))
+        else {
+            self.marks_path = None;
+            return;
+        };
+        self.marks_path = Some(path.clone());
+        self.marks = bookmarks::load(&path)
+            .into_iter()
+            .map(|bm| Mark {
+                bm,
+                anchor: AnchorState::Fresh,
+            })
+            .collect();
+        self.validate_marks();
+
+        // 上次留下的标记自动展开面板：藏在按钮后面等于没记住
+        self.show_marks = !self.marks.is_empty();
+        if !self.marks.is_empty() {
+            let n = self.marks.len();
+            let stale = self
+                .marks
+                .iter()
+                .filter(|m| m.anchor != AnchorState::Fresh)
+                .count();
+            if stale == 0 {
+                self.flash(format!("读回 {n} 条标记"));
+            } else {
+                self.flash(format!("读回 {n} 条标记，其中 {stale} 条已失效"));
+            }
+        }
+    }
+
+    /// 按指纹核对每条锚点。
+    ///
+    /// 走 `line_text_at`（直接按字节找行首行尾）而不是行索引：校验可能发生在索引
+    /// 还没建完的时候（大日志刚打开那一瞬），而"标记还对不对"这件事不该等索引。
+    fn validate_marks(&mut self) {
+        let Some(s) = &self.store else {
+            for m in &mut self.marks {
+                m.anchor = AnchorState::Lost;
+            }
+            return;
+        };
+        for m in &mut self.marks {
+            m.anchor = match s.line_text_at(m.bm.offset as usize) {
+                None => AnchorState::Lost,
+                Some(text) if m.bm.matches_head(&text) => AnchorState::Fresh,
+                Some(_) => AnchorState::Stale,
+            };
+        }
+    }
+
+    /// 按原文回找：拿记下的行首文字在当前文件里再找一次，把锚点挪过去。
+    ///
+    /// 文件被轮转、被重写之后，这是把标记救回来的唯一办法——比让人自己重搜一遍省事。
+    /// `only` 为 Some 时只处理那一条。
+    fn refind_marks(&mut self, only: Option<u64>) {
+        let Some(s) = &self.store else { return };
+        let mut moved = 0usize;
+        let mut missed = 0usize;
+        for m in &mut self.marks {
+            if only.is_some_and(|o| o != m.bm.offset) || m.anchor == AnchorState::Fresh {
+                continue;
+            }
+            if m.bm.head.is_empty() {
+                // 空行的指纹是空的，回找无从下手
+                missed += 1;
+                continue;
+            }
+            match s.find_offset_of(&m.bm.head) {
+                Some(offset) => {
+                    m.bm.offset = offset as u64;
+                    m.anchor = match s.line_text_at(offset) {
+                        Some(text) if m.bm.matches_head(&text) => AnchorState::Fresh,
+                        _ => AnchorState::Stale,
+                    };
+                    if let Some(idx) = s.line_index_at(offset) {
+                        m.bm.line = idx as u32;
+                    }
+                    moved += 1;
+                }
+                None => missed += 1,
+            }
+        }
+        // 回找可能把两条挤到同一行上，去个重
+        self.marks.sort_by_key(|m| m.bm.offset);
+        self.marks.dedup_by_key(|m| m.bm.offset);
+        self.marks_dirty = true;
+        self.flash(format!("回找完成：重定位 {moved} 条，未找到 {missed} 条"));
+    }
+
+    fn drop_stale_marks(&mut self) {
+        let before = self.marks.len();
+        self.marks.retain(|m| m.anchor == AnchorState::Fresh);
+        let dropped = before - self.marks.len();
+        if dropped > 0 {
+            self.marks_dirty = true;
+            self.flash(format!("清掉 {dropped} 条失效标记"));
+        }
+    }
+
+    /// 跳到某个文件行。
+    ///
+    /// 过滤视图里"列表位置"与"文件行号"不是一回事：那行不在结果里就先把过滤关掉，
+    /// 否则跳过去落在列表里另一个位置，看着就像跳错了。
+    fn jump_to_file_line(&mut self, line: usize) {
+        let mut target = line;
+        if self.only_matched {
+            let pos = self
+                .store
+                .as_ref()
+                .and_then(|s| s.matches().binary_search(&(line as u32)).ok());
+            match pos {
+                Some(i) => target = i,
+                None => {
+                    self.only_matched = false;
+                    self.flash("已关闭「只显示匹配行」以显示这条标记");
+                }
+            }
+        }
+        self.follow = false;
+        self.cursor_line = Some(line);
+        self.pending_jump = Some(target);
+    }
+
+    /// `F2` / `⇧F2`：在标记之间前后跳。到底了绕回另一端——标记数量少，环绕比
+    /// "到头不动"更符合直觉。
+    fn goto_mark(&mut self, delta: isize) {
+        let mut lines: Vec<usize> = self
+            .marks
+            .iter()
+            .filter(|m| m.anchor == AnchorState::Fresh)
+            .map(|m| self.mark_line(m))
+            .collect();
+        if lines.is_empty() {
+            if self.marks.is_empty() {
+                self.flash("还没有标记");
+            } else {
+                self.flash("没有可定位的标记（都失效了，可以试「按原文回找」）");
+            }
+            return;
+        }
+        lines.sort_unstable();
+        let from = self.cursor_line.unwrap_or(self.top_line);
+        let target = if delta >= 0 {
+            lines
+                .iter()
+                .find(|&&l| l > from)
+                .copied()
+                .unwrap_or(lines[0])
+        } else {
+            lines
+                .iter()
+                .rev()
+                .find(|&&l| l < from)
+                .copied()
+                .unwrap_or(*lines.last().unwrap())
+        };
+        self.jump_to_file_line(target);
+    }
+
+    /// 把编辑框里的备注落到那一条标记上。抽出来是为了能直接断言——
+    /// 塞在面板的"失去焦点"分支里就只能靠模拟点击去测。
+    fn commit_note(&mut self) {
+        if let Some(offset) = self.editing_note.take() {
+            let text = std::mem::take(&mut self.note_buf);
+            if let Some(m) = self.marks.iter_mut().find(|m| m.bm.offset == offset) {
+                m.bm.note = text;
+            }
+            self.marks_dirty = true;
+        }
+    }
+
+    /// 把标记写回侧车文件。改动即写，没有"保存"按钮。
+    fn save_marks(&mut self) {
+        if !self.marks_dirty {
+            return;
+        }
+        let Some(path) = self.marks_path.clone() else {
+            self.marks_dirty = false;
+            return;
+        };
+        let items: Vec<Bookmark> = self.marks.iter().map(|m| m.bm.clone()).collect();
+        match bookmarks::save(&path, &items) {
+            Ok(()) => self.marks_dirty = false,
+            Err(e) => {
+                // 写不进去就退回"只在本次会话有效"。不弹窗——标记本身还能用，
+                // 但面板脚上必须说清楚，否则用户会以为已经存下了。
+                self.marks_path = None;
+                self.marks_warning = Some(format!("日志目录写不进去（{e}），标记只在本次会话有效"));
+                self.marks_dirty = false;
+            }
+        }
+    }
+
+    fn export_marks(&mut self) {
+        if self.marks.is_empty() {
+            self.flash("还没有标记");
+            return;
+        }
+        let name = self
+            .store
+            .as_ref()
+            .and_then(|s| s.path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "logview".to_string());
+        let items: Vec<Bookmark> = self.marks.iter().map(|m| m.bm.clone()).collect();
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{name}.标记.md"))
+            .save_file()
+        else {
+            return;
+        };
+        match bookmarks::export_markdown(&path, &name, &items, bookmarks::now_secs()) {
+            Ok(()) => self.flash(format!("已导出 {} 条标记", items.len())),
+            Err(e) => self.flash(format!("导出失败：{e}")),
+        }
+    }
+
+    /// 右侧标记面板。
+    fn marks_panel(&mut self, ui: &mut egui::Ui) {
+        // 先把每行要显示的东西算好：面板里要同时读 marks、写 note_buf，
+        // 一份只读快照最省事。
+        let rows: Vec<MarkRow> = self
+            .marks
+            .iter()
+            .map(|m| MarkRow {
+                offset: m.bm.offset,
+                line: self
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.line_index_at(m.bm.offset as usize)),
+                head: m.bm.head.clone(),
+                note: m.bm.note.clone(),
+                time: m.bm.relative_time(bookmarks::now_secs()),
+                state: m.anchor,
+            })
+            .collect();
+        let stale = rows
+            .iter()
+            .filter(|r| r.state != AnchorState::Fresh)
+            .count();
+        let editing = self.editing_note;
+        let mut act: Option<MarkAct> = None;
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("标记 {}", rows.len())).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("收起").clicked() {
+                    act = Some(MarkAct::Hide);
+                }
+                if ui.small_button("导出").clicked() {
+                    act = Some(MarkAct::Export);
+                }
+            });
+        });
+
+        if stale > 0 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("{stale} 条已失效")).color(ui.visuals().warn_fg_color),
+                );
+                if ui.small_button("按原文回找").clicked() {
+                    act = Some(MarkAct::RefindAll);
+                }
+                if ui.small_button("清掉").clicked() {
+                    act = Some(MarkAct::DropStale);
+                }
+            });
+        }
+        if let Some(w) = &self.marks_warning {
+            ui.label(RichText::new(w).color(ui.visuals().warn_fg_color));
+        }
+
+        ui.separator();
+
+        // 脚注：标记存在哪。写不进去时必须说清楚——"以为存下了"是最坏的结果。
+        //
+        // 用嵌套的底部面板把它钉住，而不是在滚动区后面直接画一行：滚动区会吃掉所有
+        // 剩余高度，跟在它后面的东西会被挤出可视区域（第一版就是这样，脚注整行看不见）。
+        let footer = match (&self.marks_path, &self.marks_warning) {
+            (Some(p), _) => format!("侧车：{}", p.display()),
+            (None, Some(w)) => w.clone(),
+            (None, None) => "未打开文件".to_string(),
+        };
+        egui::TopBottomPanel::bottom("marks_footer").show_inside(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(footer)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                )
+                .truncate(),
+            );
+        });
+
+        egui::CentralPanel::default().show_inside(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("marks_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if rows.is_empty() {
+                        ui.label(
+                            RichText::new("滚到某一行按 b 标记；在搜索命中处按 b 也行")
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        return;
+                    }
+                    for row in &rows {
+                        let fresh = row.state == AnchorState::Fresh;
+                        let color = if fresh {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+
+                        ui.horizontal(|ui| {
+                            let num = match row.line {
+                                Some(l) => format!("{}", l + 1),
+                                None => "—".to_string(),
+                            };
+                            ui.label(RichText::new(num).monospace().small().color(color));
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(RichText::new(&row.head).color(color))
+                                        .truncate(),
+                                )
+                                .interact(egui::Sense::click());
+                            if resp.clicked() && fresh {
+                                act = Some(MarkAct::Goto(row.offset));
+                            }
+                            if !fresh {
+                                let why = match row.state {
+                                    AnchorState::Lost => "超出文件尾",
+                                    _ => "内容已变",
+                                };
+                                ui.label(
+                                    RichText::new(why).small().color(ui.visuals().warn_fg_color),
+                                );
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("×").clicked() {
+                                        act = Some(MarkAct::Delete(row.offset));
+                                    }
+                                },
+                            );
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            if editing == Some(row.offset) {
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(&mut self.note_buf)
+                                        .desired_width(f32::INFINITY)
+                                        .hint_text("备注，回车或点到别处即保存"),
+                                );
+                                resp.request_focus();
+                                if resp.lost_focus() {
+                                    act = Some(MarkAct::CommitNote);
+                                }
+                            } else {
+                                let empty = row.note.is_empty();
+                                let txt = if empty {
+                                    "＋备注".to_string()
+                                } else {
+                                    row.note.clone()
+                                };
+                                let c = if empty {
+                                    ui.visuals().weak_text_color()
+                                } else {
+                                    color
+                                };
+                                let resp = ui
+                                    .add(
+                                        egui::Label::new(RichText::new(txt).small().color(c))
+                                            .truncate(),
+                                    )
+                                    .interact(egui::Sense::click());
+                                if resp.clicked() {
+                                    act = Some(MarkAct::StartNote(row.offset));
+                                }
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(&row.time)
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                },
+                            );
+                        });
+                        ui.separator();
+                    }
+                });
+        });
+
+        match act {
+            Some(MarkAct::Goto(offset)) => {
+                if let Some(line) = self
+                    .store
+                    .as_ref()
+                    .and_then(|s| s.line_index_at(offset as usize))
+                {
+                    self.jump_to_file_line(line);
+                }
+            }
+            Some(MarkAct::Delete(offset)) => {
+                self.marks.retain(|m| m.bm.offset != offset);
+                self.marks_dirty = true;
+                self.flash("已删除该标记");
+            }
+            Some(MarkAct::StartNote(offset)) => {
+                self.note_buf = self
+                    .marks
+                    .iter()
+                    .find(|m| m.bm.offset == offset)
+                    .map(|m| m.bm.note.clone())
+                    .unwrap_or_default();
+                self.editing_note = Some(offset);
+            }
+            Some(MarkAct::CommitNote) => {
+                self.commit_note();
+            }
+            Some(MarkAct::RefindAll) => self.refind_marks(None),
+            Some(MarkAct::DropStale) => self.drop_stale_marks(),
+            Some(MarkAct::Export) => self.export_marks(),
+            Some(MarkAct::Hide) => self.show_marks = false,
+            None => {}
+        }
+    }
+
     /// 全局快捷键。
     ///
     /// 裸字母键只在搜索框没有焦点时才作为快捷键，否则会抢走正常输入。
@@ -244,10 +862,25 @@ impl LogViewApp {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
 
+        // 正在改备注时，键盘整体让给输入框：这时按 b 是想打字母 b，不是标记。
+        // Esc 收回编辑，其余快捷键一律不生效。
+        if self.editing_note.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.editing_note = None;
+                self.note_buf.clear();
+            }
+            return;
+        }
+
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             if let Some(p) = rfd::FileDialog::new().pick_file() {
                 self.open_path(p);
             }
+        }
+
+        // ⌘B 开合标记面板。放在裸字母键之前处理：COMMAND 组合任何时候都该生效。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::B)) {
+            self.show_marks = !self.show_marks;
         }
 
         let focus_hotkey = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F))
@@ -292,6 +925,13 @@ impl LogViewApp {
                 self.jump_to_line(0);
             }
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::B)) {
+            self.toggle_mark();
+        }
+        // F2 / ⇧F2 在标记之间前后跳：与编辑器里的"下一个书签"同键，习惯能直接搬过来
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2)) {
+            self.goto_mark(if shift { -1 } else { 1 });
+        }
     }
 }
 
@@ -331,10 +971,19 @@ impl eframe::App for LogViewApp {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ctx, ui));
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
+        if self.show_marks {
+            egui::SidePanel::right("marks")
+                .default_width(272.0)
+                .width_range(200.0..=460.0)
+                .show(ctx, |ui| self.marks_panel(ui));
+        }
         egui::CentralPanel::default().show(ctx, |ui| self.log_area(ui));
 
         // 快捷键放在各面板之后：此时 search_has_focus 已是本帧的最新状态
         self.handle_shortcuts(ctx);
+
+        // 标记改动即落盘：拖到帧末写，一帧里连改几次也只写一次
+        self.save_marks();
 
         // 定时重绘：索引进度、文件变化检测与跟随刷新都依赖它
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -532,6 +1181,29 @@ impl LogViewApp {
                     ui.label(format!("{n} 匹配"));
                 }
             }
+            // 标记数放状态栏而不是工具栏：工具栏在 640 宽度下已经很挤，
+            // 而状态栏本来就是一排计数，多一个不挤。
+            if !self.marks.is_empty() {
+                ui.separator();
+                let stale = self
+                    .marks
+                    .iter()
+                    .filter(|m| m.anchor != AnchorState::Fresh)
+                    .count();
+                let text = if stale == 0 {
+                    format!("标记 {}", self.marks.len())
+                } else {
+                    format!("标记 {}（{stale} 条失效）", self.marks.len())
+                };
+                ui.label(text);
+            }
+            // 一次性提示：标记了第几行、读回了几条……几秒后自己消失
+            if let Some((msg, at)) = &self.flash {
+                if at.elapsed() < Duration::from_secs(4) {
+                    ui.separator();
+                    ui.label(msg);
+                }
+            }
             if let Some(e) = &self.error {
                 ui.separator();
                 ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
@@ -614,6 +1286,10 @@ impl LogViewApp {
         let store_ref = &self.store;
         // 双击行内文字要发起的检索；闭包内拿不到 &mut self，先收集、结束后再处理
         let mut search_word: Option<String> = None;
+        // 已标记的行（按字节偏移查表）。逐行线扫 marks 也行，但那是每帧 × 每行
+        let marked: HashSet<usize> = self.marks.iter().map(|m| m.bm.offset as usize).collect();
+        // 点行号 = 把"当前行"设过去。同样先收集，出了闭包再改 self
+        let mut clicked_line: Option<usize> = None;
 
         let out = area.show_rows(ui, row_h, total, |ui, rows| {
             let Some(store) = store_ref else { return };
@@ -667,14 +1343,41 @@ impl LogViewApp {
                                         c,
                                     );
                                 }
-                                ui.add_sized(
-                                    [gutter_w, row_h],
-                                    egui::Label::new(
-                                        RichText::new(format!("{}", line_idx + 1))
-                                            .monospace()
-                                            .color(ui.visuals().weak_text_color()),
-                                    ),
+                                // 标记点。同样无论有没有标记都占住这一格，行号才不会左右跳。
+                                let (mark_cell, _) = ui.allocate_exact_size(
+                                    egui::vec2(MARK_W, row_h),
+                                    egui::Sense::hover(),
                                 );
+                                let is_marked = store
+                                    .line_offset(line_idx)
+                                    .is_some_and(|o| marked.contains(&o));
+                                if is_marked {
+                                    let r = egui::Rect::from_center_size(
+                                        mark_cell.center(),
+                                        egui::vec2(6.0, 6.0),
+                                    );
+                                    ui.painter().rect_filled(
+                                        r,
+                                        3.0,
+                                        mark_dot_color(ui.visuals().dark_mode),
+                                    );
+                                }
+                                // 行号。点击把"当前行"设到这里——于是 b / 备注定的是
+                                // 你点的那一行，而不必先滚到视口顶部。
+                                let num = ui
+                                    .add_sized(
+                                        [gutter_w, row_h],
+                                        egui::Label::new(
+                                            RichText::new(format!("{}", line_idx + 1))
+                                                .monospace()
+                                                .color(ui.visuals().weak_text_color()),
+                                        ),
+                                    )
+                                    .interact(egui::Sense::click())
+                                    .on_hover_text("点击设为当前行（按 b 标记）");
+                                if num.clicked() {
+                                    clicked_line = Some(line_idx);
+                                }
                                 if let Some(word) =
                                     render_content(ui, buf, &head, &query, cs, wrap, regex)
                                 {
@@ -707,10 +1410,6 @@ impl LogViewApp {
             }
         });
 
-        if let Some(word) = search_word {
-            self.search_for(word);
-        }
-
         if !stick {
             self.scroll_offset = out.state.offset.y;
         }
@@ -727,6 +1426,19 @@ impl LogViewApp {
         } else {
             top_row
         };
+
+        // 点行号 = 把当前行设过去，之后 b / 备注都对着它
+        if let Some(line) = clicked_line {
+            self.cursor_line = Some(line);
+        }
+
+        // 记下视口能装几行：标记要判断"当前行还看不看得见"（见 mark_target）
+        self.visible_rows = (out.inner_rect.height() / row_pitch).max(1.0) as usize;
+
+        // 双击取词：拿词去搜，视图不动
+        if let Some(word) = search_word {
+            self.search_for(word);
+        }
     }
 }
 
@@ -743,6 +1455,21 @@ const PRIMARY_FILL: u32 = 0x2563EB;
 const LEVEL_RULE_W: f32 = 3.0;
 /// 级别色条与行号之间的间距，色条有无都要占住这段宽度，内容列才会对齐
 const LEVEL_RULE_GAP: f32 = 5.0;
+/// 标记点那一列的宽度。同样无论有没有标记都要占住：否则标记一出现，
+/// 整列行号跟着右移，"同一行在不同时刻对不齐"。
+const MARK_W: f32 = 16.0;
+
+/// 标记点的颜色。
+///
+/// 蓝色的命中底色与黄绿的级别标签都被占用了，标记用紫色，三者在两个主题下都分得开；
+/// 只需要 3:1 的非文字对比度（点是个色块，不是文字），所以不必按 WCAG AA 的文本来挑。
+fn mark_dot_color(dark: bool) -> Color32 {
+    if dark {
+        hex(0xAFA9EC)
+    } else {
+        hex(0x534AB7)
+    }
+}
 /// 查找日志级别时最多跳过几个 token。
 ///
 /// 定这个上限是为了修掉一个误判：原先的判据是"整行包含 ERROR 就给整行染色"，
@@ -1286,6 +2013,9 @@ mod test_support {
         let mut app = LogViewApp::new();
         app.query = "ERROR".to_string();
         app.store = Some(store);
+        // 这些测试不渲染帧，视口行数得自己给：mark_target 要求"当前行还在可见范围内"
+        // 才认它，不渲染时 visible_rows 会停在默认值 1。760px 高的窗口约 40 行。
+        app.visible_rows = 40;
         app
     }
 
@@ -1326,6 +2056,7 @@ mod test_support {
         app.store = Some(LogStore::open(p).unwrap());
         settle_app(&mut app);
         app.follow = false;
+        app.visible_rows = 40;
         app
     }
 
@@ -1421,6 +2152,83 @@ mod shortcut_tests {
 
         press(&ctx, &mut app, egui::Key::Slash, egui::Modifiers::NONE);
         assert!(app.focus_search, "/ 应请求聚焦搜索框");
+    }
+
+    /// `b` 标记的是"当前行"，还没定位过就用视口第一行——这是可预期的，
+    /// 而且状态栏会把行号回报出来，所以不用猜自己标了哪一行。
+    #[test]
+    fn b_marks_the_viewport_top_when_nothing_was_located_yet() {
+        let ctx = egui::Context::default();
+        let mut app = super::test_support::big_app("markb", 500);
+        app.search_has_focus = false;
+        app.top_line = 3;
+
+        press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        assert_eq!(app.marks.len(), 1, "b 应标记一行");
+        assert_eq!(app.marks[0].bm.line, 3, "应标在视口第一行上");
+        assert!(app.marks_dirty, "改动了就该落盘");
+
+        press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        assert!(app.marks.is_empty(), "再按一次应取消");
+    }
+
+    /// 搜索跳转之后，"当前行"就是刚跳到的那一行：跳完直接 b 标它
+    #[test]
+    fn b_follows_the_last_jump() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("markjump");
+        app.search_has_focus = false;
+        app.top_line = 0;
+
+        press(&ctx, &mut app, egui::Key::N, egui::Modifiers::NONE); // 跳到第 2 个命中（第 3 行）
+        press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        assert_eq!(app.marks.len(), 1);
+        assert_eq!(app.marks[0].bm.line, 2, "应标在刚跳到的命中行上");
+    }
+
+    /// F2 / ⇧F2 在标记之间前后走，到底了绕回另一端
+    #[test]
+    fn f2_walks_between_marks_and_wraps() {
+        let ctx = egui::Context::default();
+        let mut app = super::test_support::big_app("markf2", 500);
+        app.search_has_focus = false;
+
+        for line in [10usize, 100, 300] {
+            app.top_line = line;
+            press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        }
+        assert_eq!(app.marks.len(), 3);
+
+        app.cursor_line = Some(0);
+        press(&ctx, &mut app, egui::Key::F2, egui::Modifiers::NONE);
+        assert_eq!(app.cursor_line, Some(10), "F2 应跳到第一条");
+
+        press(&ctx, &mut app, egui::Key::F2, egui::Modifiers::NONE);
+        assert_eq!(app.cursor_line, Some(100));
+
+        press(&ctx, &mut app, egui::Key::F2, egui::Modifiers::SHIFT);
+        assert_eq!(app.cursor_line, Some(10), "⇧F2 应往回");
+
+        press(&ctx, &mut app, egui::Key::F2, egui::Modifiers::SHIFT);
+        assert_eq!(app.cursor_line, Some(300), "到头了绕回最后一条");
+    }
+
+    /// 改备注时键盘要整体让给输入框：这时按 b 是想打字母 b
+    #[test]
+    fn typing_in_the_note_editor_never_triggers_shortcuts() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_hits("marknote");
+        app.search_has_focus = false;
+        app.top_line = 0;
+        press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        assert_eq!(app.marks.len(), 1);
+
+        app.editing_note = Some(app.marks[0].bm.offset);
+        press(&ctx, &mut app, egui::Key::B, egui::Modifiers::NONE);
+        assert_eq!(app.marks.len(), 1, "编辑备注时按 b 不该再标记一行");
+
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.editing_note.is_none(), "Esc 应收回编辑");
     }
 }
 
@@ -1894,5 +2702,176 @@ mod theme_tests {
 
         let back = next_theme(next_theme(next_theme(None)));
         assert_eq!(back, None, "三次点击应回到起点");
+    }
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::test_support::settle_app;
+    use super::*;
+    use std::path::Path;
+
+    /// 造一个临时日志，并清掉可能残留的侧车文件——上一次跑剩下的侧车会让断言莫名其妙。
+    fn temp_log(tag: &str, content: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logview_marks_{tag}.log"));
+        let _ = std::fs::remove_file(bookmarks::sidecar_path(&p));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// 走真实打开路径（`open_path`），于是侧车的读取与逐条校验都真的跑了一遍
+    fn open(path: &Path) -> LogViewApp {
+        let mut app = LogViewApp::new();
+        app.open_path(path.to_path_buf());
+        settle_app(&mut app);
+        // 这些测试不渲染帧，视口行数得自己给：mark_target 只在"当前行仍然可见"时才认它
+        app.visible_rows = 40;
+        app
+    }
+
+    fn drop_sidecar(path: &Path) {
+        let _ = std::fs::remove_file(bookmarks::sidecar_path(path));
+    }
+
+    /// 标记要落到日志旁边的侧车文件里，重开同一个文件时读回来，并且仍然定位得上
+    #[test]
+    fn marks_round_trip_through_the_sidecar() {
+        let p = temp_log("roundtrip", "one\ntwo\nthree\nfour\n");
+        let mut app = open(&p);
+        app.cursor_line = Some(2);
+        app.toggle_mark();
+        assert_eq!(app.marks.len(), 1);
+        assert_eq!(app.marks[0].bm.line, 2);
+        assert_eq!(app.marks[0].bm.head, "three", "指纹取的是那一行的内容");
+        app.save_marks();
+
+        let sidecar = bookmarks::sidecar_path(&p);
+        assert!(sidecar.exists(), "标记应写在日志旁边的侧车文件里");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(text.contains("\"head\":\"three\""), "侧车内容：{text}");
+
+        let again = open(&p);
+        assert_eq!(again.marks.len(), 1, "重开应读回上次的标记");
+        assert_eq!(again.marks[0].anchor, AnchorState::Fresh);
+        assert_eq!(again.marks[0].bm.head, "three");
+        assert!(again.show_marks, "有上次留下的标记时面板应自动展开");
+
+        drop_sidecar(&p);
+    }
+
+    /// 那一行被改写之后，锚点必须判失效、并且**不跳**——静默跳到错的行上是最坏的结果
+    #[test]
+    fn a_rewritten_line_is_stale_and_never_jumped_to() {
+        let p = temp_log("stale", "alpha line\nbeta line\n");
+        let sidecar = bookmarks::sidecar_path(&p);
+        let stale = Bookmark {
+            offset: 0,
+            line: 0,
+            head: "这里原本是别的内容".to_string(),
+            note: String::new(),
+            at: 0,
+        };
+        bookmarks::save(&sidecar, std::slice::from_ref(&stale)).unwrap();
+
+        let mut app = open(&p);
+        assert_eq!(app.marks.len(), 1);
+        assert_eq!(
+            app.marks[0].anchor,
+            AnchorState::Stale,
+            "偏移处的内容对不上就该判失效"
+        );
+
+        app.cursor_line = None;
+        app.top_line = 0;
+        app.goto_mark(1);
+        assert!(app.pending_jump.is_none(), "失效的标记不该跳");
+
+        drop_sidecar(&p);
+    }
+
+    /// 日志被整体重写（轮转那种）之后，按原文回找能把锚点挪到新位置
+    #[test]
+    fn refind_moves_anchors_after_the_file_changed() {
+        let p = temp_log("refind", "first\nsecond\nthird\n");
+        let mut app = open(&p);
+        app.cursor_line = Some(1); // second
+        app.toggle_mark();
+        app.save_marks();
+        // Windows 下映射还活着时，写这个文件会被拒（README 已知限制里那条），
+        // 所以先把 app 放掉再重写文件
+        drop(app);
+
+        // 前面插进来两行：second 从第 2 行挪到了第 4 行
+        std::fs::write(&p, "x\ny\nfirst\nsecond\nthird\n").unwrap();
+
+        let mut again = open(&p);
+        assert_eq!(again.marks.len(), 1);
+        assert_eq!(
+            again.marks[0].anchor,
+            AnchorState::Stale,
+            "偏移已经漂了，先判失效而不是硬跳"
+        );
+
+        again.refind_marks(None);
+        assert_eq!(
+            again.marks[0].anchor,
+            AnchorState::Fresh,
+            "按原文应能找回来"
+        );
+        assert_eq!(again.marks[0].bm.line, 3, "行号也要更新成现在的");
+
+        drop_sidecar(&p);
+    }
+
+    /// 过滤视图里，标记所在的行可能根本不在结果里：这时要先把过滤关掉，
+    /// 否则 pending_jump 会被当成"列表里的第 N 行"，跳过去落在别的行上。
+    #[test]
+    fn jumping_to_a_mark_outside_the_filter_turns_it_off() {
+        let p = temp_log("filter", "ERROR one\nplain\nstill plain\nERROR two\n");
+        let mut app = open(&p);
+        app.cursor_line = Some(1);
+        app.toggle_mark();
+
+        app.query = "ERROR".to_string();
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+        app.only_matched = true;
+        app.top_line = 0;
+        app.cursor_line = None;
+
+        app.jump_to_file_line(1);
+        assert!(!app.only_matched, "那行不在命中里，应自动关掉过滤");
+        assert_eq!(app.pending_jump, Some(1), "关掉过滤后可以直接用文件行号");
+
+        // 反过来：命中里的行仍然走"列表位置"
+        app.only_matched = true;
+        app.jump_to_file_line(3);
+        assert!(app.only_matched, "命中行不该把过滤关掉");
+        assert_eq!(app.pending_jump, Some(1), "第 4 行是第 2 个命中");
+
+        drop_sidecar(&p);
+    }
+
+    /// 备注落到那一条标记上，然后跟着侧车一起保存
+    #[test]
+    fn a_note_is_committed_and_saved_with_the_mark() {
+        let p = temp_log("note", "one\ntwo\n");
+        let mut app = open(&p);
+        app.cursor_line = Some(0);
+        app.toggle_mark();
+
+        app.note_buf = "OOM 前最后一条 ERROR".to_string();
+        app.editing_note = Some(app.marks[0].bm.offset);
+        app.commit_note();
+        assert_eq!(app.marks[0].bm.note, "OOM 前最后一条 ERROR");
+        assert!(app.editing_note.is_none(), "提交后应退出编辑");
+        assert!(app.marks_dirty);
+
+        app.save_marks();
+        let again = open(&p);
+        assert_eq!(again.marks[0].bm.note, "OOM 前最后一条 ERROR");
+
+        drop_sidecar(&p);
     }
 }
