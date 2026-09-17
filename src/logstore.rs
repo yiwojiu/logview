@@ -188,6 +188,61 @@ impl LogStore {
         }
     }
 
+    /// 第 idx 行的起始字节偏移。索引还没覆盖到这一行时返回 None。
+    ///
+    /// 标记（书签）用它把"行"翻译成"字节偏移"——偏移才是能跨会话存下来的锚点。
+    pub fn line_offset(&self, idx: usize) -> Option<usize> {
+        self.line_starts
+            .get(idx)
+            .copied()
+            .filter(|&o| o < self.real_len)
+    }
+
+    /// 某个字节偏移落在第几行（0 基）。索引尚未覆盖到那个位置时返回 None ——
+    /// 调用方据此知道"现在还算不出来"，而不是拿到一个错的行号。
+    pub fn line_index_at(&self, offset: usize) -> Option<usize> {
+        if offset >= self.scanned {
+            return None;
+        }
+        self.line_starts
+            .partition_point(|&s| s <= offset)
+            .checked_sub(1)
+    }
+
+    /// 取 offset 所在那一行的解码文本。
+    ///
+    /// **不依赖行索引**：直接往前找最近的换行定行首、往后找换行定行尾。标记的校验
+    /// 必须走这条路——校验可能发生在索引还没建完的时候（大日志刚打开那一瞬），
+    /// 也可能发生在偏移已经不在行首的位置上（文件被改过）。
+    pub fn line_text_at(&self, offset: usize) -> Option<String> {
+        let bytes = self.mmap.get(..self.real_len)?;
+        if offset >= bytes.len() {
+            return None;
+        }
+        let start = memchr::memrchr(b'\n', &bytes[..offset])
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = memchr::memchr(b'\n', &bytes[offset..])
+            .map(|i| offset + i)
+            .unwrap_or(bytes.len());
+        let mut out = String::new();
+        decode_into(trim_eol(&bytes[start..end]), self.encoding, &mut out);
+        Some(out)
+    }
+
+    /// 在整个文件里按**本文件的编码**找一段文本，返回起始字节偏移。
+    ///
+    /// 给"按原文回找"用：标记失效（文件被轮转/重写）之后，拿当初记下的那行文字
+    /// 在现在的文件里再找一次，找到就把锚点挪过去——比让人自己重搜一遍省事。
+    pub fn find_offset_of(&self, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        let bytes = self.mmap.get(..self.real_len)?;
+        let (encoded, _, _) = self.encoding.encode(needle);
+        memchr::memmem::find(bytes, &encoded)
+    }
+
     /// 把第 idx 行解码后追加到 out（复用缓冲，避免每行分配）
     pub fn read_line_into(&self, idx: usize, out: &mut String) -> bool {
         let Some((s, e)) = self.line_range(idx) else {
