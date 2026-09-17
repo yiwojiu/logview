@@ -87,6 +87,12 @@ pub struct LogViewApp {
     note_buf: String,
     /// "当前行"：标记与跳转的目标。取最近一次定位落点，没有就取视口第一行
     cursor_line: Option<usize>,
+    /// 最近一次从标记面板或 `F2` 跳到的**文件行号**，在日志区里铺一层标记色底。
+    ///
+    /// 左缘那个紫点只有 4px 宽，跳过去之后在一屏几十行里并不好找。
+    /// 任何别的定位动作（搜索跳转、`g`/`G`、点行号）都会把它清掉：
+    /// 它表达的是"你刚点了哪一条标记"，不随时间累积成一片紫底。
+    focused_mark: Option<usize>,
     /// 视口能装下多少行（由 log_area 每帧记录）：判断"当前行还看不看得见"要用它
     visible_rows: usize,
     /// 状态栏上的一次性提示（标记了第几行之类），几秒后自己消失
@@ -175,6 +181,7 @@ impl Default for LogViewApp {
             editing_note: None,
             note_buf: String::new(),
             cursor_line: None,
+            focused_mark: None,
             visible_rows: 1,
             flash: None,
             last_refresh: Instant::now(),
@@ -304,6 +311,8 @@ impl LogViewApp {
         }
         // 手动跳转时退出跟随，否则会被 tail 拉回底部
         self.follow = false;
+        // 视线已经移到命中上了，标记那层高亮该收掉（留在别处的紫底没有来由）
+        self.focused_mark = None;
         let cur = self.match_cursor as isize + delta;
         let cur = cur.clamp(0, n as isize - 1) as usize;
         self.match_cursor = cur;
@@ -320,6 +329,8 @@ impl LogViewApp {
     /// 跳到指定位置（同时退出跟随，否则会被 tail 拉回底部）
     fn jump_to_line(&mut self, idx: usize) {
         self.follow = false;
+        // 跳到别处去了（g / G），标记那层高亮收掉
+        self.focused_mark = None;
         self.pending_jump = Some(idx);
     }
 
@@ -393,6 +404,10 @@ impl LogViewApp {
             Some(pos) => {
                 self.marks.remove(pos);
                 self.marks_dirty = true;
+                // 取消掉的正是高亮那一条，收掉紫底
+                if self.focused_mark == Some(line) {
+                    self.focused_mark = None;
+                }
                 self.flash(format!("已取消第 {} 行的标记", line + 1));
             }
             None => {
@@ -403,6 +418,8 @@ impl LogViewApp {
                 self.marks.sort_by_key(|m| m.bm.offset);
                 self.marks_dirty = true;
                 self.cursor_line = Some(line);
+                // 刚标的这条就是"当前那条"：铺上紫底，一眼看清标在了第几行
+                self.focused_mark = Some(line);
                 let n = self.marks.len();
                 self.flash(format!("已标记第 {} 行（共 {n} 条）", line + 1));
             }
@@ -415,6 +432,7 @@ impl LogViewApp {
         self.marks_warning = None;
         self.editing_note = None;
         self.cursor_line = None;
+        self.focused_mark = None;
         self.marks_dirty = false;
 
         let Some(path) = self
@@ -507,6 +525,8 @@ impl LogViewApp {
         // 回找可能把两条挤到同一行上，去个重
         self.marks.sort_by_key(|m| m.bm.offset);
         self.marks.dedup_by_key(|m| m.bm.offset);
+        // 行号刚被改写，之前记下的那个已经指不准了：收掉高亮，让用户重新点一条
+        self.focused_mark = None;
         self.marks_dirty = true;
         self.flash(format!("回找完成：重定位 {moved} 条，未找到 {missed} 条"));
     }
@@ -516,6 +536,8 @@ impl LogViewApp {
         self.marks.retain(|m| m.anchor == AnchorState::Fresh);
         let dropped = before - self.marks.len();
         if dropped > 0 {
+            // 清掉的可能正是高亮那一条，收了稳妥
+            self.focused_mark = None;
             self.marks_dirty = true;
             self.flash(format!("清掉 {dropped} 条失效标记"));
         }
@@ -542,6 +564,8 @@ impl LogViewApp {
         }
         self.follow = false;
         self.cursor_line = Some(line);
+        // 这一行铺标记色底：面板里点一条、或 F2 跳一条，都要能在日志区一眼认出落在哪
+        self.focused_mark = Some(line);
         self.pending_jump = Some(target);
     }
 
@@ -579,6 +603,32 @@ impl LogViewApp {
                 .unwrap_or(*lines.last().unwrap())
         };
         self.jump_to_file_line(target);
+    }
+
+    /// 删掉一条标记（面板条目上的 `×`）。
+    ///
+    /// 删的正好是高亮那一条时，把高亮一起收掉——否则日志区里留下一行没有标记的紫底。
+    fn remove_mark(&mut self, offset: u64) {
+        let hit = self
+            .marks
+            .iter()
+            .find(|m| m.bm.offset == offset)
+            .map(|m| self.mark_line(m));
+        if hit == self.focused_mark {
+            self.focused_mark = None;
+        }
+        self.marks.retain(|m| m.bm.offset != offset);
+        self.marks_dirty = true;
+        self.flash("已删除该标记");
+    }
+
+    /// 点行号：把"当前行"设过去，之后按 `b`、写备注都对着它。
+    ///
+    /// 同时收掉标记那层高亮——这是"选光标"，不是"选标记"，
+    /// 留着紫底会让人以为还停在面板里点的那条上。
+    fn select_line(&mut self, line: usize) {
+        self.cursor_line = Some(line);
+        self.focused_mark = None;
     }
 
     /// 把编辑框里的备注落到那一条标记上。抽出来是为了能直接断言——
@@ -730,7 +780,12 @@ impl LogViewApp {
                     }
                     for row in &rows {
                         let fresh = row.state == AnchorState::Fresh;
-                        let color = if fresh {
+                        // 这一条是不是刚跳过去的那条：是的话行号与首行用标记色，
+                        // 与日志区那行的紫底呼应——否则从面板点到日志区，视线回来就找不到是第几条
+                        let focused = row.line.is_some() && row.line == self.focused_mark;
+                        let color = if focused {
+                            mark_dot_color(ui.visuals().dark_mode)
+                        } else if fresh {
                             ui.visuals().text_color()
                         } else {
                             ui.visuals().weak_text_color()
@@ -830,11 +885,7 @@ impl LogViewApp {
                     self.jump_to_file_line(line);
                 }
             }
-            Some(MarkAct::Delete(offset)) => {
-                self.marks.retain(|m| m.bm.offset != offset);
-                self.marks_dirty = true;
-                self.flash("已删除该标记");
-            }
+            Some(MarkAct::Delete(offset)) => self.remove_mark(offset),
             Some(MarkAct::StartNote(offset)) => {
                 self.note_buf = self
                     .marks
@@ -921,6 +972,7 @@ impl LogViewApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G)) {
             if shift {
                 self.jump_to_end = true;
+                self.focused_mark = None;
             } else {
                 self.jump_to_line(0);
             }
@@ -1277,6 +1329,8 @@ impl LogViewApp {
 
         // 当前匹配项所在的行：整行加底色，否则按 n 跳转之后看不出落在哪一条
         let current_line = self.current_match_line();
+        // 刚从面板或 F2 跳到的标记行：同样铺一层底，用标记色
+        let focused_line = self.focused_mark;
         let regex = self.highlight_regex.as_ref();
         let buf = &mut self.buf;
         let query = self.query.clone();
@@ -1306,13 +1360,18 @@ impl LogViewApp {
                     if store.read_line_into(line_idx, buf) {
                         // 行首结构只解析一次：色条与行内上色共用同一份结果
                         let head = parse_line_head(buf);
-                        if current_line == Some(line_idx) {
+                        // 铺底优先给标记：它是用户刚刚点/跳的那一条，比"当前命中"更该被认出来
+                        let row_bg = match row_bg_kind(line_idx, focused_line, current_line) {
+                            RowBg::Mark => Some(mark_row_bg(ui.visuals().dark_mode)),
                             // 与命中词的黄色高亮区分开，这里用冷色整行铺底
-                            let bg = if ui.visuals().dark_mode {
+                            RowBg::Match => Some(if ui.visuals().dark_mode {
                                 egui::Color32::from_rgb(30, 44, 62)
                             } else {
                                 egui::Color32::from_rgb(226, 240, 253)
-                            };
+                            }),
+                            RowBg::None => None,
+                        };
+                        if let Some(bg) = row_bg {
                             ui.painter().rect_filled(
                                 egui::Rect::from_min_size(
                                     ui.cursor().min,
@@ -1429,7 +1488,7 @@ impl LogViewApp {
 
         // 点行号 = 把当前行设过去，之后 b / 备注都对着它
         if let Some(line) = clicked_line {
-            self.cursor_line = Some(line);
+            self.select_line(line);
         }
 
         // 记下视口能装几行：标记要判断"当前行还看不看得见"（见 mark_target）
@@ -1470,6 +1529,43 @@ fn mark_dot_color(dark: bool) -> Color32 {
         hex(0x534AB7)
     }
 }
+
+/// 从面板/F2 跳到的标记行，整行铺这层底。
+///
+/// 与 [`mark_dot_color`] 同色系（都取自同一支紫），一眼能看出"紫底就是紫点那一行"。
+/// 底色要浅到不夺正文：正文用主题的 text_color，实测两种主题下都在 9:1 以上
+/// （浅色 #E7E3F8 对 #1B1B1B 约 13.7:1；深色 #322C52 对 #DCDCDC 约 9.5:1），
+/// 高于 WCAG AA 的 4.5:1，也高于 AAA 的 7:1。
+fn mark_row_bg(dark: bool) -> Color32 {
+    if dark {
+        hex(0x322C52)
+    } else {
+        hex(0xE7E3F8)
+    }
+}
+
+/// 一行上该铺哪种底。两类高亮互斥，同时命中时**标记优先**——它是用户刚刚点的那一条，
+/// 而"当前命中"只是检索的副产品，认错了也不影响判断。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowBg {
+    /// 不铺
+    None,
+    /// 当前搜索命中行（冷色底）
+    Match,
+    /// 刚从面板 / `F2` 跳到的标记行（标记色底）
+    Mark,
+}
+
+fn row_bg_kind(line: usize, focused_mark: Option<usize>, current_match: Option<usize>) -> RowBg {
+    if focused_mark == Some(line) {
+        RowBg::Mark
+    } else if current_match == Some(line) {
+        RowBg::Match
+    } else {
+        RowBg::None
+    }
+}
+
 /// 查找日志级别时最多跳过几个 token。
 ///
 /// 定这个上限是为了修掉一个误判：原先的判据是"整行包含 ERROR 就给整行染色"，
@@ -2873,5 +2969,94 @@ mod mark_tests {
         assert_eq!(again.marks[0].bm.note, "OOM 前最后一条 ERROR");
 
         drop_sidecar(&p);
+    }
+
+    /// 面板点击与 F2 都要把目标行记下来（日志区靠它铺紫底），
+    /// 而"选光标"类动作（搜索跳转、g/G、点行号）该把它收掉。
+    #[test]
+    fn the_mark_highlight_tracks_the_last_mark_jump() {
+        let p = temp_log("focus", "one\ntwo\nthree\nfour\n");
+        let mut app = open(&p);
+        app.cursor_line = Some(2);
+        app.toggle_mark();
+        assert_eq!(app.focused_mark, Some(2), "刚按 b 标下的那条就是当前那条");
+
+        // ① 面板点一条、F2 跳一条 → 高亮跟过去
+        app.focused_mark = None; // 先清掉，模拟"之前被别的定位动作收走过"
+        app.jump_to_file_line(2);
+        assert_eq!(app.focused_mark, Some(2), "面板点击要聚焦那一行");
+        app.focused_mark = None;
+        app.goto_mark(1);
+        assert_eq!(app.focused_mark, Some(2), "F2 跳到的那条也要聚焦");
+
+        // ② 搜索跳转 → 收掉（视线已经移到命中上了）
+        app.jump_to_file_line(2);
+        app.query = "one".to_string();
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+        // 检索完成后由每帧的 apply_search_outcome 决定去向（测试不渲染帧，得手动走这一步）
+        app.apply_search_outcome();
+        assert_eq!(app.focused_mark, None, "搜索跳转之后不该留着标记高亮");
+
+        // ③ g 跳开头 → 收掉
+        app.jump_to_file_line(2);
+        app.jump_to_line(0);
+        assert_eq!(app.focused_mark, None, "g 跳开头之后不该留着标记高亮");
+
+        // ④ 点行号 → 收掉（那是选光标，不是选标记）
+        app.jump_to_file_line(2);
+        app.select_line(1);
+        assert_eq!(app.focused_mark, None, "点行号之后不该留着标记高亮");
+
+        drop_sidecar(&p);
+    }
+
+    /// 取消、删除、换文件之后都不能留下高亮——否则日志区里有一行没有标记的紫底，
+    /// 看着就像标记还在。
+    #[test]
+    fn removing_a_mark_clears_its_highlight() {
+        let p = temp_log("focus_remove", "one\ntwo\nthree\n");
+        let mut app = open(&p);
+
+        // 再按一次 b 取消
+        app.cursor_line = Some(1);
+        app.toggle_mark();
+        assert_eq!(app.focused_mark, Some(1));
+        app.toggle_mark();
+        assert!(app.marks.is_empty());
+        assert_eq!(app.focused_mark, None, "取消标记后高亮要一起收掉");
+
+        // 面板条目上的 ×
+        app.cursor_line = Some(2);
+        app.toggle_mark();
+        let offset = app.marks[0].bm.offset;
+        app.remove_mark(offset);
+        assert!(app.marks.is_empty());
+        assert_eq!(app.focused_mark, None, "删除标记后高亮要一起收掉");
+
+        // 换文件
+        app.jump_to_file_line(0);
+        let other = temp_log("focus_other", "alpha\nbeta\n");
+        app.open_path(other.clone());
+        settle_app(&mut app);
+        assert_eq!(app.focused_mark, None, "换文件后不该留着上一份文件的高亮");
+
+        drop_sidecar(&p);
+        drop_sidecar(&other);
+    }
+
+    /// 铺底的优先级：同一行既是命中又是刚跳到的标记时显示成标记——
+    /// 那才是用户刚点的动作，而"当前命中"只是检索的副产品。
+    #[test]
+    fn the_mark_wins_over_the_current_hit() {
+        assert_eq!(row_bg_kind(5, Some(5), Some(5)), RowBg::Mark);
+        assert_eq!(row_bg_kind(5, Some(5), None), RowBg::Mark);
+        assert_eq!(row_bg_kind(5, None, Some(5)), RowBg::Match);
+        assert_eq!(
+            row_bg_kind(5, Some(4), Some(5)),
+            RowBg::Match,
+            "标记在别的行上时不该抢这一行"
+        );
+        assert_eq!(row_bg_kind(5, Some(4), Some(6)), RowBg::None);
     }
 }
