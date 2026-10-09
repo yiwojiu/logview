@@ -55,6 +55,11 @@ pub struct LogViewApp {
     search_dirty: Option<Instant>,
     /// 当前跳转目标行
     pending_jump: Option<usize>,
+    /// 键盘翻页请求，单位是**列表行**（正值向下，过滤视图下即命中序号）。
+    ///
+    /// 与 `pending_jump` 同理：翻一屏要按"可见行数"折成像素，而可见行数、行距、
+    /// 总行数都只有渲染日志区时才知道，所以先排队、下一帧在 `log_area` 里结算。
+    pending_scroll: Option<isize>,
     /// 检索结果到位后的去向；None 表示这一轮已经处理过
     pending_after_search: Option<OnSearchDone>,
     /// 匹配项游标（用于上一个/下一个）
@@ -166,6 +171,7 @@ impl Default for LogViewApp {
             error: None,
             search_dirty: None,
             pending_jump: None,
+            pending_scroll: None,
             pending_after_search: None,
             match_cursor: 0,
             scroll_offset: 0.0,
@@ -203,6 +209,8 @@ impl LogViewApp {
                 }
                 self.highlight_regex = self.compiled_highlight_regex();
                 self.scroll_offset = 0.0;
+                // 换文件了：上一份文件排队中的翻页不能落到新文件上
+                self.pending_scroll = None;
                 self.match_cursor = 0;
                 self.store = Some(s);
                 self.error = None;
@@ -332,6 +340,28 @@ impl LogViewApp {
         // 跳到别处去了（g / G），标记那层高亮收掉
         self.focused_mark = None;
         self.pending_jump = Some(idx);
+    }
+
+    /// 键盘滚动：按**列表行**平移视口，`rows` 正数向下。
+    ///
+    /// 翻页是**滚动**、不是定位：`focused_mark` 那层底不收（它表达的是"刚点了哪条标记"），
+    /// 但跟随尾部要让位，否则下一帧又被拉回底部，按了等于没按。
+    fn scroll_view(&mut self, rows: isize) {
+        if rows == 0 {
+            return;
+        }
+        self.follow = false;
+        self.pending_scroll = Some(rows);
+    }
+
+    /// PageUp / PageDown：整屏平移，`dir` 正数向下。
+    ///
+    /// 步长是「可见行数 − 1 行」：留一行重叠，翻页前后能对上同一行，
+    /// 和终端里 less / tail 的手感一致。可见行数还没被渲染记录过（默认 1）时
+    /// 至少翻一行，免得按键毫无反应。
+    fn scroll_by_page(&mut self, dir: isize) {
+        let step = self.visible_rows.saturating_sub(1).max(1) as isize;
+        self.scroll_view(dir * step);
     }
 
     // ── 标记（书签） ───────────────────────────────────────────────
@@ -984,6 +1014,37 @@ impl LogViewApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2)) {
             self.goto_mark(if shift { -1 } else { 1 });
         }
+
+        // ── 翻页键 ─────────────────────────────────────────────────────
+        //
+        // egui 0.31 的 ScrollArea 自己不认任何键盘（scroll_area.rs 里连 `Key::`
+        // 都没出现过），所以这几个键必须由应用来接；不接的话三个平台上都是
+        // "按了没反应"——和操作系统无关。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageDown)) {
+            self.scroll_by_page(1);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::PageUp)) {
+            self.scroll_by_page(-1);
+        }
+        // Home / End 与 g / G 同义：文件首 / 末。走同一条定位路径，
+        // 于是「清掉 focused_mark、退出跟随」这些规矩不用再写一遍。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Home)) {
+            self.jump_to_line(0);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::End)) {
+            self.jump_to_end = true;
+            self.focused_mark = None;
+        }
+        // 方向键 = 单行滚动。egui 拿方向键兼做"焦点在控件之间移动"，但那要求
+        // **已经有控件持有焦点**（`find_widget_in_direction` 拿不到当前焦点就直接返回 None），
+        // 而日志区这边唯一能持有焦点的就是搜索框——它一有焦点上面就 return 了。
+        // 所以这里不会与焦点导航打架。
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+            self.scroll_view(1);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+            self.scroll_view(-1);
+        }
     }
 }
 
@@ -1142,6 +1203,8 @@ impl LogViewApp {
                      {CMD}F 或 / — 聚焦搜索框\n\
                      n / N — 下 / 上一个命中\n\
                      g / G — 跳到开头 / 末尾\n\
+                     PgUp / PgDn 或 ↑ / ↓ — 上下滚动\n\
+                     Home / End — 跳到开头 / 末尾\n\
                      Esc — 清空检索\n\
                      {CMD}O — 打开文件\n\
                      双击行内文字 — 就地搜索该词，视图不移动"
@@ -1310,9 +1373,25 @@ impl LogViewApp {
         let row_pitch = row_h + ui.spacing().item_spacing.y;
         let gutter_w = (format!("{total}").len() as f32) * 8.0 + 12.0;
 
+        // 键盘翻页：把"平移多少行"折成像素。
+        //
+        // 起点取**实际偏移**而不是 top_line：过滤视图下 top_line 存的是文件行号，
+        // 而行号与列表位置在这里不是一回事（匹配行之间隔着多少文件行是不定的）。
+        // 偏移量本来就在"列表行 × 行距"这条轴上，两种视图共用一套算术。
+        //
+        // 落点对齐到行首：翻一屏之后顶行永远是完整的一行，否则每翻一次都会
+        // 残留零点几行的偏移，几十次之后顶行就被切掉一半。
+        if let Some(delta) = self.pending_scroll.take() {
+            let cur = (self.scroll_offset / row_pitch).round() as isize;
+            let last = total.saturating_sub(1) as isize;
+            let target = (cur + delta).clamp(0, last);
+            self.scroll_offset = target as f32 * row_pitch;
+        }
+
         // 跳转：换算成滚动偏移
         // pending_jump 存的已经是「列表中的行位置」：
         // only_matched 模式下是匹配序号，否则是文件行号，两者都直接乘行距。
+        // 放在翻页之后：同一帧里两者都排队时，明确的"跳到某处"优先。
         if let Some(target) = self.pending_jump.take() {
             self.scroll_offset = (target as f32 * row_pitch - 120.0).max(0.0);
         }
@@ -1469,9 +1548,12 @@ impl LogViewApp {
             }
         });
 
-        if !stick {
-            self.scroll_offset = out.state.offset.y;
-        }
+        // 无论是否跟随都记下实际偏移。
+        //
+        // 跟随时这个值不参与渲染（stick 时不会喂给 ScrollArea），但它必须保持新鲜：
+        // 正 tail 的时候按 PageUp，要"从当前底部往回翻一屏"，而不是从某个早就
+        // 过期的旧偏移开始跳。记下来只花一个 f32，省掉"先关跟随、再等一帧"的两段式。
+        self.scroll_offset = out.state.offset.y;
 
         // 记下视口顶部是哪一行：双击取词后要靠它把游标对齐到当前位置。
         // 「只显示匹配行」模式下滚动的单位是命中序号，先换算回文件行号。
@@ -2174,14 +2256,9 @@ mod test_support {
         });
         app.top_line
     }
-}
 
-#[cfg(test)]
-mod shortcut_tests {
-    use super::test_support::app_with_hits;
-    use super::*;
-
-    fn press(
+    /// 敲一次键（只走快捷键这一层，不渲染）
+    pub fn press(
         ctx: &egui::Context,
         app: &mut LogViewApp,
         key: egui::Key,
@@ -2202,6 +2279,12 @@ mod shortcut_tests {
         };
         let _ = ctx.run(raw, |ctx| app.handle_shortcuts(ctx));
     }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::test_support::{app_with_hits, press};
+    use super::*;
 
     /// 关键边界：搜索框有焦点时按字母必须当作普通输入，不能触发跳转，
     /// 否则用户根本没法在搜索框里打出 n 或 g。
@@ -2325,6 +2408,211 @@ mod shortcut_tests {
 
         press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
         assert!(app.editing_note.is_none(), "Esc 应收回编辑");
+    }
+}
+
+/// 翻页键。egui 0.31 的 `ScrollArea` 自己不认任何键盘（`scroll_area.rs` 里连
+/// `Key::` 都没出现过），所以这几个键全靠应用来接——不接的话在三个平台上
+/// 都是"按了没反应"，跟操作系统无关。
+#[cfg(test)]
+mod scroll_key_tests {
+    use super::test_support::{big_app, frame, press, settle_app};
+    use super::*;
+
+    /// 键盘是在面板渲染**之后**处理的（`search_has_focus` 要取本帧的最新值），
+    /// 所以按键排的是"下一帧的账"：这一帧渲染完才生效，下一帧渲染时才看出来。
+    #[test]
+    fn page_down_moves_one_screen_less_one_line() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pagedn", 10_000);
+
+        // 先渲染一帧：可见行数得由实际渲染量出来（默认值是 1）
+        assert_eq!(frame(&ctx, &mut app), 0, "前提：从文件开头看起");
+        let step = app.visible_rows - 1;
+        assert!(
+            step > 1,
+            "前提：视口应装得下若干行，实际 {}",
+            app.visible_rows
+        );
+
+        press(&ctx, &mut app, egui::Key::PageDown, egui::Modifiers::NONE);
+        assert_eq!(
+            app.pending_scroll,
+            Some(step as isize),
+            "PageDown 应排下一屏的翻页请求（留一行重叠）"
+        );
+
+        assert_eq!(
+            frame(&ctx, &mut app),
+            step,
+            "PageDown 后视口顶部应正好下移一屏减一行"
+        );
+    }
+
+    #[test]
+    fn page_up_goes_back_a_screen() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pageup", 10_000);
+        // 先落到文件中部：起点在 0 的话往上翻会撞到边界，看不出"翻了一屏"
+        app.scroll_offset = 8_000.0;
+        let before = frame(&ctx, &mut app) as isize;
+        let step = app.visible_rows - 1;
+        assert!(before > step as isize, "前提：起点不在文件开头");
+
+        press(&ctx, &mut app, egui::Key::PageUp, egui::Modifiers::NONE);
+        let after = frame(&ctx, &mut app) as isize;
+        // 起点取的是实际像素偏移、落点对齐到行首，两者之间会有不到一行的取整差
+        let expected = before - step as isize;
+        assert!(
+            (after - expected).abs() <= 1,
+            "PageUp 应退回一屏减一行：期望约 {expected}，实际 {after}"
+        );
+    }
+
+    /// 到顶再按 PageUp：夹在 0 上停下，不能翻成负数（那会滚出内容之外）
+    #[test]
+    fn page_up_at_the_top_stays_at_the_first_line() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pagetop", 10_000);
+
+        frame(&ctx, &mut app);
+        press(&ctx, &mut app, egui::Key::PageUp, egui::Modifiers::NONE);
+        assert_eq!(frame(&ctx, &mut app), 0);
+    }
+
+    /// 到底再按 PageDown：夹在最后一行，而不是把视口推到内容之外
+    #[test]
+    fn page_down_stops_at_the_last_line() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pagebottom", 400);
+
+        frame(&ctx, &mut app);
+        for _ in 0..30 {
+            press(&ctx, &mut app, egui::Key::PageDown, egui::Modifiers::NONE);
+            frame(&ctx, &mut app);
+        }
+        let total = app.store.as_ref().unwrap().line_count();
+        assert!(
+            app.top_line < total,
+            "视口顶部应落在文件内：top={} total={total}",
+            app.top_line
+        );
+        assert!(
+            app.top_line + app.visible_rows + 1 >= total,
+            "应一路翻到能看见末尾：top={} visible={} total={total}",
+            app.top_line,
+            app.visible_rows
+        );
+    }
+
+    /// Home / End 与 g / G 同义，走同一条定位路径
+    #[test]
+    fn home_and_end_jump_to_the_edges() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("homeend", 10_000);
+        let total = app.store.as_ref().unwrap().line_count();
+
+        press(&ctx, &mut app, egui::Key::End, egui::Modifiers::NONE);
+        frame(&ctx, &mut app);
+        assert!(
+            app.top_line + app.visible_rows + 1 >= total,
+            "End 之后末尾应在视口里：top={} visible={} total={total}",
+            app.top_line,
+            app.visible_rows
+        );
+
+        press(&ctx, &mut app, egui::Key::Home, egui::Modifiers::NONE);
+        assert_eq!(frame(&ctx, &mut app), 0, "Home 应回到第一行");
+    }
+
+    /// 方向键滚一行
+    #[test]
+    fn arrow_keys_move_a_single_line() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("arrowkeys", 10_000);
+        frame(&ctx, &mut app);
+
+        press(&ctx, &mut app, egui::Key::ArrowDown, egui::Modifiers::NONE);
+        assert_eq!(frame(&ctx, &mut app), 1, "↓ 应下移一行");
+
+        press(&ctx, &mut app, egui::Key::ArrowUp, egui::Modifiers::NONE);
+        assert_eq!(frame(&ctx, &mut app), 0, "↑ 应退回一行");
+    }
+
+    /// 正 tail 的时候按 PageUp，要"从当前底部往回翻一屏"。
+    ///
+    /// 跟随状态下偏移不喂给 ScrollArea，但必须照样记下来：记成旧值的话，
+    /// 这一下会直接跳到文件开头——离用户想去的"上一屏"有一万个行远。
+    #[test]
+    fn page_up_while_following_steps_back_from_the_bottom() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("tailpgup", 10_000);
+        app.follow = true;
+
+        let bottom = frame(&ctx, &mut app);
+        let total = app.store.as_ref().unwrap().line_count();
+        assert!(
+            bottom + app.visible_rows + 1 >= total,
+            "前提：跟随时视口应停在文件末尾"
+        );
+
+        let step = app.visible_rows - 1;
+        press(&ctx, &mut app, egui::Key::PageUp, egui::Modifiers::NONE);
+        assert!(!app.follow, "手动翻页应退出跟随，否则下一帧又被拉回底部");
+
+        let after = frame(&ctx, &mut app) as isize;
+        // 起点是"实际偏移"，与 top_line 之间最多差一行取整
+        let expected = bottom as isize - step as isize;
+        assert!(
+            (after - expected).abs() <= 1,
+            "应从底部往回翻一屏：期望约 {expected}，实际 {after}"
+        );
+    }
+
+    /// 过滤视图下翻页的单位是**命中序号**，不是文件行号。
+    ///
+    /// 命中之间隔着多少文件行是不定的（这里每 101 行才有一处），按行号翻出去
+    /// 就不是"一屏"了——翻三次能翻到几万行以外。所以落点必须按列表位置对齐。
+    #[test]
+    fn page_down_in_filtered_view_moves_by_match_index() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pagefiltered", 10_000);
+        app.query = "进度".to_string();
+        app.only_matched = true;
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+
+        frame(&ctx, &mut app);
+        let step = app.visible_rows - 1;
+
+        press(&ctx, &mut app, egui::Key::PageDown, egui::Modifiers::NONE);
+        frame(&ctx, &mut app);
+
+        let idx = {
+            let s = app.store.as_ref().unwrap();
+            s.matches()
+                .iter()
+                .position(|&l| l as usize == app.top_line)
+                .expect("翻页后视口顶部应正好落在某个命中行上（按行对齐）")
+        };
+        assert!(
+            (idx as isize - step as isize).abs() <= 1,
+            "过滤视图下应翻一屏命中：期望约 {step}，实际 {idx}"
+        );
+    }
+
+    /// 搜索框有焦点时，翻页键要留给输入框（那里它们是移动光标）
+    #[test]
+    fn page_keys_are_left_to_the_search_box() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("pagefocus", 10_000);
+        frame(&ctx, &mut app);
+        app.search_has_focus = true;
+
+        press(&ctx, &mut app, egui::Key::PageDown, egui::Modifiers::NONE);
+        press(&ctx, &mut app, egui::Key::End, egui::Modifiers::NONE);
+        assert!(app.pending_scroll.is_none(), "搜索框有焦点时不该翻页");
+        assert!(!app.jump_to_end, "搜索框有焦点时 End 不该跳末尾");
     }
 }
 
