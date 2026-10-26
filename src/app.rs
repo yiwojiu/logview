@@ -10,6 +10,28 @@ use std::time::{Duration, Instant};
 /// 单行最大渲染字符数，超出截断，避免超长行拖慢渲染
 const MAX_RENDER_CHARS: usize = 4000;
 
+/// `Ctrl+C` 复制选中行时的上限。
+///
+/// 选择可以跨很远的距离（`G` 之后 `Shift`+点击开头就是一整个文件），
+/// 不设上限的话一次复制能把几百 MB 拼进内存、再塞进剪贴板，进程直接没反应。
+const COPY_MAX_ROWS: usize = 20_000;
+const COPY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 拖动选行时，指针进入视口上下边缘多少像素内就开始自动滚动。
+///
+/// 取 24px（约一行半）而不是几像素：实测按 14px 时，指针停在最后一行下沿附近
+/// 仍然判在带外，看上去就是"拖到底了也不滚"。带宽超过半行之后，
+/// 只要指针压到最后一行就必然触发，不用瞄。
+const DRAG_EDGE: f32 = 24.0;
+
+/// 指针越过边带后每帧滚几行。
+///
+/// 拖得越远滚得越快：1 行/帧起步，最多 6 行/帧（60 fps 下约 360 行/秒，
+/// 按一屏 40 行算约 9 屏/秒）。恒定速度的话，想跨几千行得按着不动很久。
+fn drag_scroll_step(over: f32) -> isize {
+    (1.0 + over / 24.0).min(6.0) as isize
+}
+
 /// 搜索框的固定 Id，用于快捷键聚焦与失焦
 const SEARCH_ID: &str = "logview_search";
 
@@ -92,6 +114,18 @@ pub struct LogViewApp {
     note_buf: String,
     /// "当前行"：标记与跳转的目标。取最近一次定位落点，没有就取视口第一行
     cursor_line: Option<usize>,
+    /// 按行选择的区间。存的是**文件行号**，不是视口内的列表位置：
+    /// 翻页、切「只显示匹配行」、文件追加都不该把它弄错行。
+    row_sel: Option<RowSel>,
+    /// 正按住鼠标拖动选择。只有它为真时才跑"拖到边缘自动滚动"。
+    row_sel_drag: bool,
+    /// 处于"划字"模式（Alt 按下进入，普通点击退出）。
+    ///
+    /// 不能每帧读 `modifiers.alt` 当开关：Alt 一松就停止绘制文本框，
+    /// 而 egui 的 `LabelSelectionState::end_pass` 只要发现这一帧没见到选择
+    /// 的两个端点，就会把选择整个丢掉——于是"松手时顺手松开 Alt"就等于
+    /// 选择被删。实测松开 Alt 前后：差异像素 6760 → 0。
+    char_select: bool,
     /// 最近一次从标记面板或 `F2` 跳到的**文件行号**，在日志区里铺一层标记色底。
     ///
     /// 左缘那个紫点只有 4px 宽，跳过去之后在一屏几十行里并不好找。
@@ -105,6 +139,56 @@ pub struct LogViewApp {
 
     last_refresh: Instant,
     buf: String,
+}
+
+/// 按行选择的区间。
+///
+/// `anchor` 是按下时那一行（Shift 扩展时不动），`focus` 跟着指针走。
+/// 两者都存**文件行号**且不保证顺序——向上拖时 focus 会比 anchor 小，
+/// 取值一律走 [`RowSel::range`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowSel {
+    anchor: usize,
+    focus: usize,
+}
+
+impl RowSel {
+    /// 排好序的闭区间两端
+    fn range(self) -> (usize, usize) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    fn contains(self, line: usize) -> bool {
+        let (a, b) = self.range();
+        (a..=b).contains(&line)
+    }
+
+    fn len(self) -> usize {
+        let (a, b) = self.range();
+        b - a + 1
+    }
+}
+
+/// 清掉 egui 那层字符级划选。
+///
+/// 行选择与文本划选是两套高亮，同时存在会让人分不清哪个才是"我选的"。
+/// `LabelSelectionState` 按 viewport 存着一个全局单例，不清的话它还会在下一帧
+/// 接着画上次的范围。
+fn clear_label_selection(ctx: &egui::Context) {
+    let mut st = egui::text_selection::LabelSelectionState::load(ctx);
+    if st.has_selection() {
+        st.clear_selection();
+        st.store(ctx);
+    }
+}
+
+/// 现在还有没有字符级划选。用来判断"划字模式"是不是该自己退出。
+fn has_label_selection(ctx: &egui::Context) -> bool {
+    egui::text_selection::LabelSelectionState::load(ctx).has_selection()
 }
 
 /// 一条标记加上它此刻的定位状态。
@@ -187,6 +271,9 @@ impl Default for LogViewApp {
             editing_note: None,
             note_buf: String::new(),
             cursor_line: None,
+            row_sel: None,
+            row_sel_drag: false,
+            char_select: false,
             focused_mark: None,
             visible_rows: 1,
             flash: None,
@@ -211,6 +298,9 @@ impl LogViewApp {
                 self.scroll_offset = 0.0;
                 // 换文件了：上一份文件排队中的翻页不能落到新文件上
                 self.pending_scroll = None;
+                // 选择存的是行号，换文件后指向的是别的行，必须清掉
+                self.clear_row_sel();
+                self.char_select = false;
                 self.match_cursor = 0;
                 self.store = Some(s);
                 self.error = None;
@@ -661,6 +751,144 @@ impl LogViewApp {
         self.focused_mark = None;
     }
 
+    /// 按下鼠标（行号或行内容）开始选行。
+    ///
+    /// 锚点用**按下那一刻**定，而不是等 `clicked()`：后者要松手才成立，
+    /// 而拖动过程中锚点必须已经定住，否则整段拖选没有起点。
+    /// `shift` 为真时沿用原来的锚点，只挪焦点——这就是"翻页不丢前面选择"的关键：
+    /// 选择只存在于这里，与视口滚到哪里无关，不像 egui 的文本划选那样
+    /// 端点滚出视口就被丢掉。
+    fn begin_row_sel(&mut self, ctx: &egui::Context, line: usize, shift: bool) {
+        let anchor = match (shift, self.row_sel) {
+            (true, Some(s)) => s.anchor,
+            _ => line,
+        };
+        self.row_sel = Some(RowSel {
+            anchor,
+            focus: line,
+        });
+        self.row_sel_drag = true;
+        // 跟随时滚动偏移不参与渲染，拖到边缘就没法滚；选行必然要看别处，关掉
+        self.follow = false;
+        self.select_line(line);
+        // 行选择与 egui 的文本划选是两套高亮，同时出现会互相干扰
+        clear_label_selection(ctx);
+    }
+
+    /// 拖动中挪焦点，锚点不动
+    fn extend_row_sel(&mut self, line: usize) {
+        if let Some(s) = &mut self.row_sel {
+            if s.focus != line {
+                s.focus = line;
+                self.cursor_line = Some(line);
+            }
+        }
+    }
+
+    fn clear_row_sel(&mut self) {
+        self.row_sel = None;
+        self.row_sel_drag = false;
+    }
+
+    /// 把选中的行拼成可复制的文本。
+    ///
+    /// 复制走的是**文件原文**，不是屏幕上那份 galley 文本：后者被
+    /// [`MAX_RENDER_CHARS`] 截断、不换行时还带省略号，超长行复制出去会缺内容。
+    ///
+    /// 「只显示匹配行」时只收落在区间内的匹配行——否则会把中间没显示的行也带上，
+    /// 复制出来的东西跟屏幕上看到的对不上。
+    ///
+    /// 返回（文本, 行数, 是否被上限截断）。
+    fn selection_text(&self) -> Option<(String, usize, bool)> {
+        let sel = self.row_sel?;
+        let store = self.store.as_ref()?;
+        let total = store.line_count();
+        if total == 0 {
+            return None;
+        }
+        let (a, b) = sel.range();
+        let b = b.min(total - 1);
+
+        let mut out = String::new();
+        let mut rows = 0usize;
+        let mut truncated = false;
+        let mut buf = String::with_capacity(1024);
+
+        let mut push = |line: usize, out: &mut String, rows: &mut usize| -> bool {
+            if *rows >= COPY_MAX_ROWS || out.len() >= COPY_MAX_BYTES {
+                return false;
+            }
+            buf.clear();
+            if !store.read_line_into(line, &mut buf) {
+                return true;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&buf);
+            *rows += 1;
+            true
+        };
+
+        if self.only_matched {
+            let matches = store.matches();
+            let start = matches.partition_point(|&l| (l as usize) < a);
+            for &l in &matches[start.min(matches.len())..] {
+                let line = l as usize;
+                if line > b {
+                    break;
+                }
+                if !push(line, &mut out, &mut rows) {
+                    truncated = true;
+                    break;
+                }
+            }
+        } else {
+            for line in a..=b {
+                if !push(line, &mut out, &mut rows) {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+
+        Some((out, rows, truncated))
+    }
+
+    /// `Ctrl+C` 复制选中行。仅在行选择存在、且不在划字模式下才接管。
+    ///
+    /// 划字模式下这条事件留给 egui 自己处理（它复制的是行内选中的那几个字）。
+    /// 判断看 `char_select` 而不是 `modifiers.alt`：Alt 往往在松手时就放掉了，
+    /// 按 `Ctrl+C` 那一刻读 alt 会判错。
+    ///
+    /// 必须把 `Event::Copy` 从输入队列里摘掉：egui 的行内文本选择也会监听同一个事件，
+    /// 不摘的话两边都往剪贴板写，谁后写谁生效，结果不可预测。
+    fn handle_copy(&mut self, ctx: &egui::Context) {
+        if self.row_sel.is_none() || self.char_select {
+            return;
+        }
+        let wanted = ctx.input_mut(|i| {
+            let before = i.events.len();
+            i.events.retain(|e| !matches!(e, egui::Event::Copy));
+            i.events.len() != before
+        });
+        if !wanted {
+            return;
+        }
+        let Some((text, rows, truncated)) = self.selection_text() else {
+            return;
+        };
+        ctx.copy_text(text);
+        self.flash(if truncated {
+            format!(
+                "已复制 {rows} 行（超过上限，已截断到 {COPY_MAX_ROWS} 行 / {}）",
+                human_size(COPY_MAX_BYTES)
+            )
+        } else {
+            format!("已复制 {rows} 行")
+        });
+    }
+
     /// 把编辑框里的备注落到那一条标记上。抽出来是为了能直接断言——
     /// 塞在面板的"失去焦点"分支里就只能靠模拟点击去测。
     fn commit_note(&mut self) {
@@ -969,6 +1197,16 @@ impl LogViewApp {
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Slash)));
 
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            // Esc 一次退一层：先收掉选择（选行或划字），再清检索。
+            // 但搜索框有焦点时它就是"退出输入"，别被选择抢走。
+            if !self.search_has_focus
+                && (self.row_sel.is_some() || self.char_select || has_label_selection(ctx))
+            {
+                self.clear_row_sel();
+                self.char_select = false;
+                clear_label_selection(ctx);
+                return;
+            }
             self.query.clear();
             if let Some(s) = &mut self.store {
                 s.clear_search();
@@ -1051,6 +1289,10 @@ impl LogViewApp {
 impl eframe::App for LogViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_drop(ctx);
+
+        // 复制要在面板渲染**之前**处理：egui 的文本划选在渲染时读同一个事件，
+        // 晚一步就变成两边都往剪贴板写。
+        self.handle_copy(ctx);
 
         if let Some(dark) = self.dark {
             ctx.set_visuals(if dark {
@@ -1200,12 +1442,16 @@ impl LogViewApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let _ = ui.button("?").on_hover_text(format!(
                     "快捷键\n\
+                     左键拖动 — 选行（拖到视口边缘自动滚动）\n\
+                     Shift+点击 — 把选择扩展到那一行\n\
+                     按住 Alt 拖动 — 只选行内文字\n\
+                     {CMD}C — 复制选中的整行\n\
                      {CMD}F 或 / — 聚焦搜索框\n\
                      n / N — 下 / 上一个命中\n\
                      g / G — 跳到开头 / 末尾\n\
                      PgUp / PgDn 或 ↑ / ↓ — 上下滚动\n\
                      Home / End — 跳到开头 / 末尾\n\
-                     Esc — 清空检索\n\
+                     Esc — 取消选择 / 清空检索\n\
                      {CMD}O — 打开文件\n\
                      双击行内文字 — 就地搜索该词，视图不移动"
                 ));
@@ -1298,6 +1544,11 @@ impl LogViewApp {
             }
             // 标记数放状态栏而不是工具栏：工具栏在 640 宽度下已经很挤，
             // 而状态栏本来就是一排计数，多一个不挤。
+            // 选中行数放得比标记更前：它变化更频繁，也是刚做完的动作
+            if let Some(sel) = self.row_sel {
+                ui.separator();
+                ui.label(format!("已选 {} 行", sel.len()));
+            }
             if !self.marks.is_empty() {
                 ui.separator();
                 let stale = self
@@ -1406,6 +1657,30 @@ impl LogViewApp {
             area = area.vertical_scroll_offset(self.scroll_offset);
         }
 
+        // 按下鼠标决定用哪套选择：按住 Alt 进"划字"模式，否则回"选行"模式。
+        //
+        // 模式必须粘住，不能每帧问 `modifiers.alt`：松手时顺手松开 Alt 是很自然的
+        // 动作，而 egui 的字符选择只要有一帧没被绘制，`end_pass` 就认为端点丢了、
+        // 直接把选择删掉（`has_reached_primary/secondary` 双假 → `selection.take()`）。
+        // 实测：松开左键但 Alt 仍按住时选择还在，松开 Alt 那一刻差异像素 6760 → 0。
+        let (pressed, alt) = ui.input(|i| (i.pointer.any_pressed(), i.modifiers.alt));
+        if pressed {
+            self.char_select = alt;
+            if alt {
+                // 两套高亮不并存：划字时把选行收掉
+                self.clear_row_sel();
+            } else {
+                clear_label_selection(ui.ctx());
+            }
+        } else if self.char_select
+            && !ui.input(|i| i.pointer.primary_down())
+            && !has_label_selection(ui.ctx())
+        {
+            // 松手之后选择已经不存在了（拖出视口、或滚走了）：模式跟着退出，
+            // 免得光标一直是 I 形却选不中任何东西。
+            self.char_select = false;
+        }
+
         // 当前匹配项所在的行：整行加底色，否则按 n 跳转之后看不出落在哪一条
         let current_line = self.current_match_line();
         // 刚从面板或 F2 跳到的标记行：同样铺一层底，用标记色
@@ -1421,8 +1696,21 @@ impl LogViewApp {
         let mut search_word: Option<String> = None;
         // 已标记的行（按字节偏移查表）。逐行线扫 marks 也行，但那是每帧 × 每行
         let marked: HashSet<usize> = self.marks.iter().map(|m| m.bm.offset as usize).collect();
-        // 点行号 = 把"当前行"设过去。同样先收集，出了闭包再改 self
-        let mut clicked_line: Option<usize> = None;
+        // 按下开始选行（文件行号, 是否按着 Shift）。同样先收集，出了闭包再改 self
+        let mut press_at: Option<(usize, bool)> = None;
+
+        // 选行相关的输入状态，闭包里每行都要用，先取一次
+        let row_sel = self.row_sel;
+        // 划字模式下才走 egui 的字符级划选；默认拖动一律是选行。
+        // 注意这里读的是粘住的模式标志，不是 `modifiers.alt`。
+        let text_select = self.char_select;
+        let pointer_pressed = ui.input(|i| i.pointer.any_pressed());
+        let pointer_down = ui.input(|i| i.pointer.primary_down());
+        let shift_held = ui.input(|i| i.modifiers.shift);
+        // 拖动中要判断指针落在哪一行。换行模式下行高随内容变，几何反算会漂，
+        // 所以记下本帧每行的实际纵向区间（只关心 y，横向整行都算）。
+        let track_rows = self.row_sel_drag;
+        let mut row_tops: Vec<(usize, f32, f32)> = Vec::new();
 
         let out = area.show_rows(ui, row_h, total, |ui, rows| {
             let Some(store) = store_ref else { return };
@@ -1435,20 +1723,25 @@ impl LogViewApp {
                 };
                 // 空行或越界的行也要占位，否则行距会从这里开始错位
                 if let Some(line_idx) = line_idx {
+                    // 拖动选行时记下这一行的纵向区间，供"指针落在哪一行"反查
+                    if track_rows {
+                        row_tops.push((line_idx, row_top, row_h));
+                    }
                     buf.clear();
                     if store.read_line_into(line_idx, buf) {
                         // 行首结构只解析一次：色条与行内上色共用同一份结果
                         let head = parse_line_head(buf);
-                        // 铺底优先给标记：它是用户刚刚点/跳的那一条，比"当前命中"更该被认出来
-                        let row_bg = match row_bg_kind(line_idx, focused_line, current_line) {
-                            RowBg::Mark => Some(mark_row_bg(ui.visuals().dark_mode)),
-                            // 与命中词的黄色高亮区分开，这里用冷色整行铺底
-                            RowBg::Match => Some(if ui.visuals().dark_mode {
-                                egui::Color32::from_rgb(30, 44, 62)
-                            } else {
-                                egui::Color32::from_rgb(226, 240, 253)
-                            }),
-                            RowBg::None => None,
+                        // 选中的那一整片优先：它是连续区间，中间被"标记色"挖掉一块
+                        // 会显得破碎。标记行仍有左缘紫点，信息没丢。
+                        let selected = row_sel.is_some_and(|s| s.contains(line_idx));
+                        let row_bg = if selected {
+                            Some(select_row_bg(ui.visuals().dark_mode))
+                        } else {
+                            match row_bg_kind(line_idx, focused_line, current_line) {
+                                RowBg::Mark => Some(mark_row_bg(ui.visuals().dark_mode)),
+                                RowBg::Match => Some(match_row_bg(ui.visuals().dark_mode)),
+                                RowBg::None => None,
+                            }
                         };
                         if let Some(bg) = row_bg {
                             ui.painter().rect_filled(
@@ -1500,26 +1793,57 @@ impl LogViewApp {
                                         mark_dot_color(ui.visuals().dark_mode),
                                     );
                                 }
-                                // 行号。点击把"当前行"设到这里——于是 b / 备注定的是
+                                // 行号。按下即开始选行（拖动可取一整段），
+                                // 同时把"当前行"设到这里——于是 b / 备注定的是
                                 // 你点的那一行，而不必先滚到视口顶部。
+                                let num_color = if selected {
+                                    ui.visuals().strong_text_color()
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
                                 let num = ui
                                     .add_sized(
                                         [gutter_w, row_h],
                                         egui::Label::new(
                                             RichText::new(format!("{}", line_idx + 1))
                                                 .monospace()
-                                                .color(ui.visuals().weak_text_color()),
+                                                .color(num_color),
                                         ),
                                     )
-                                    .interact(egui::Sense::click())
-                                    .on_hover_text("点击设为当前行（按 b 标记）");
-                                if num.clicked() {
-                                    clicked_line = Some(line_idx);
-                                }
-                                if let Some(word) =
-                                    render_content(ui, buf, &head, &query, cs, wrap, regex)
+                                    .interact(egui::Sense::click_and_drag())
+                                    .on_hover_text(
+                                        "点击选这一行，Shift+点击扩展到这一行\n\
+                                         （按住 Alt 拖动可选行内文字，Ctrl+C 复制）",
+                                    );
+                                if num.is_pointer_button_down_on()
+                                    && pointer_pressed
+                                    && !text_select
                                 {
+                                    press_at = Some((line_idx, shift_held));
+                                }
+                                let (word, content_resp) = render_content(
+                                    ui,
+                                    buf,
+                                    &head,
+                                    HighlightCfg {
+                                        query: &query,
+                                        case_sensitive: cs,
+                                        regex,
+                                    },
+                                    wrap,
+                                    text_select,
+                                    selected,
+                                );
+                                if let Some(word) = word {
                                     search_word = Some(word);
+                                }
+                                // 在行内容上按下也选行（日志场景要的是"这几行"，
+                                // 而不是行内某几个字；要选字就按住 Alt）
+                                if content_resp.is_pointer_button_down_on()
+                                    && pointer_pressed
+                                    && !text_select
+                                {
+                                    press_at = Some((line_idx, shift_held));
                                 }
                             });
                         });
@@ -1568,9 +1892,50 @@ impl LogViewApp {
             top_row
         };
 
-        // 点行号 = 把当前行设过去，之后 b / 备注都对着它
-        if let Some(line) = clicked_line {
-            self.select_line(line);
+        // 按下即选定：锚点在按下那一帧就定住，拖动过程只挪焦点
+        if let Some((line, shift)) = press_at {
+            self.begin_row_sel(ui.ctx(), line, shift);
+        }
+
+        // 拖动中：焦点跟着指针走；指针越过视口上下边界就持续滚动。
+        //
+        // 这一段正是"以前只能选当前屏"的答案：egui 的文本划选在指针离开所有
+        // label 之后就不再更新端点，也不会替你滚动，端点一滚出视口还会被主动丢弃。
+        // 选行模型把区间存在 self 里，与视口无关，于是拖到边界可以一直滚、
+        // 翻页也不会把前面的选择弄丢。
+        if self.row_sel_drag {
+            if !pointer_down {
+                self.row_sel_drag = false;
+            } else if let Some(p) = ui.ctx().pointer_interact_pos() {
+                let rect = out.inner_rect;
+                let over_down = p.y - (rect.bottom() - DRAG_EDGE);
+                let over_up = (rect.top() + DRAG_EDGE) - p.y;
+                if over_down > 0.0 || over_up > 0.0 {
+                    let (step, edge) = if over_down > 0.0 {
+                        (drag_scroll_step(over_down), row_tops.last().map(|t| t.0))
+                    } else {
+                        (-drag_scroll_step(over_up), row_tops.first().map(|t| t.0))
+                    };
+                    // 焦点先落在边缘那一行，下一帧滚过去之后自然继续往前
+                    if let Some(line) = edge {
+                        self.extend_row_sel(line);
+                    }
+                    if step != 0 {
+                        let max_off = (total.saturating_sub(1) as f32 * row_pitch).max(0.0);
+                        self.scroll_offset =
+                            (self.scroll_offset + step as f32 * row_pitch).clamp(0.0, max_off);
+                        // 拖动中必须每帧重绘：update 末尾那句只保证 250ms 一次，
+                        // 按那个节奏滚起来是一跳一跳的。
+                        ui.ctx().request_repaint();
+                    }
+                } else if let Some(&(line, _, _)) = row_tops
+                    .iter()
+                    .find(|(_, top, h)| p.y >= *top && p.y < top + h)
+                {
+                    // 指针在视口内：按实际行区间找行，开了换行也准
+                    self.extend_row_sel(line);
+                }
+            }
         }
 
         // 记下视口能装几行：标记要判断"当前行还看不看得见"（见 mark_target）
@@ -1623,6 +1988,35 @@ fn mark_row_bg(dark: bool) -> Color32 {
         hex(0x322C52)
     } else {
         hex(0xE7E3F8)
+    }
+}
+
+/// 当前搜索命中行铺的底色（冷色，与命中词的黄色高亮区分开）。
+///
+/// 抽成函数是因为它现在要参与对比度断言：选中行底色必须与它分得开，
+/// 而两处写死的字面量一旦有一边被改，这个约束就悄悄失效了。
+fn match_row_bg(dark: bool) -> Color32 {
+    if dark {
+        hex(0x1E2C3E)
+    } else {
+        hex(0xE2F0FD)
+    }
+}
+
+/// 选中行铺的底色。
+///
+/// 与命中行（浅 `#E2F0FD` / 深 `#1E2C3E`）和标记行（紫）都要分得开：选择是用户
+/// 正在做的动作，得比"检索副产品"更实一档。浅色取 `#ADD6FF`（与 VS Code 的
+/// 选择色一致，用户不用重新学），深色取 `#264F78`。
+///
+/// 选中行的正文**同时换成 `strong_text_color()`**（见 [`render_content`]）：
+/// 深色主题的普通正文是灰 140，压在蓝底上只有 3.0:1，怎么调底色都救不回来
+/// ——要么蓝底暗到看不见，要么字读不清。加亮字色之后 7.1:1，蓝底也还能看出是"选中"。
+fn select_row_bg(dark: bool) -> Color32 {
+    if dark {
+        hex(0x264F78)
+    } else {
+        hex(0xADD6FF)
     }
 }
 
@@ -1881,29 +2275,46 @@ fn parse_line_head(line: &str) -> LineHead {
     head
 }
 
-/// 绘制一行内容，返回该行被双击时命中的词。
+/// 行内高亮要用的三样东西。
 ///
-/// 这里没有用 `Label::selectable`，而是自己 layout galley 再交给
-/// `LabelSelectionState::label_text_selection`。两者都提供划选与复制，
-/// 区别在于后者会把 galley 留在手上，才能反查"双击点到了哪个词"——
-/// egui 并未对外暴露 Label 当前选中的文本，这是唯一可行的路子。
+/// 打成一个结构体只是为了让 [`render_content`] 的参数不越过 clippy 的 7 个上限；
+/// 这三者本来就是同一件事：按什么词、怎么比、要不要当正则。
+#[derive(Clone, Copy)]
+struct HighlightCfg<'a> {
+    query: &'a str,
+    case_sensitive: bool,
+    regex: Option<&'a regex::Regex>,
+}
+
+/// 绘制一行内容，返回该行被双击时命中的词，以及这一行的交互响应。
+///
+/// `text_select` 为真时才走 egui 的字符级划选（`Label::selectable` 内部也是这条路）：
+/// 自己 layout galley 再交给 `LabelSelectionState::label_text_selection`，是为了把
+/// galley 留在手上、能反查"双击点到了哪个词"。默认不走它——日志要的是按行选，
+/// 而 egui 的文本划选跨出视口就会把端点丢掉。
 fn render_content(
     ui: &mut egui::Ui,
     text: &str,
     head: &LineHead,
-    query: &str,
-    case_sensitive: bool,
+    hl: HighlightCfg<'_>,
     wrap: bool,
-    regex: Option<&regex::Regex>,
-) -> Option<String> {
+    text_select: bool,
+    emphasized: bool,
+) -> (Option<String>, egui::Response) {
     let mut shown = text;
     if shown.len() > MAX_RENDER_CHARS {
         shown = floor_char_boundary(shown, MAX_RENDER_CHARS);
     }
 
-    let base_color = ui.visuals().text_color();
+    // 选中行用更亮的正文：深色主题的普通正文压在蓝底上只有 3:1，
+    // 换底色救不回来（见 select_row_bg 的说明）
+    let base_color = if emphasized {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
     let font_id: FontId = TextStyle::Monospace.resolve(ui.style());
-    let highlights = match_ranges(shown, query, case_sensitive, regex);
+    let highlights = match_ranges(shown, hl.query, hl.case_sensitive, hl.regex);
     let mut job = styled_job(
         shown,
         head,
@@ -1921,28 +2332,44 @@ fn render_content(
     }
 
     let galley = ui.fonts(|f| f.layout_job(job));
-    let (rect, response) = ui.allocate_exact_size(galley.size(), egui::Sense::click_and_drag());
+    // 宽度取整行：在行尾空白处按下也要能开始选行，否则只有文字那一截能点
+    let size = egui::vec2(ui.available_width(), galley.size().y);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
     if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        // 选行模式下给箭头：I 形光标暗示"可以划字"，与默认行为不符
+        ui.ctx().set_cursor_icon(if text_select {
+            egui::CursorIcon::Text
+        } else {
+            egui::CursorIcon::Default
+        });
     }
 
-    // 划选、复制与绘制都交给 egui，与 Label 内部的做法一致
-    egui::text_selection::LabelSelectionState::label_text_selection(
-        ui,
-        &response,
-        rect.min,
-        galley.clone(),
-        base_color,
-        egui::Stroke::NONE,
-    );
+    if text_select {
+        // 划选、复制与绘制都交给 egui，与 Label 内部的做法一致
+        egui::text_selection::LabelSelectionState::label_text_selection(
+            ui,
+            &response,
+            rect.min,
+            galley.clone(),
+            base_color,
+            egui::Stroke::NONE,
+        );
+    } else {
+        // 只画，不接文本选择。光标位置由 allocate 推进，行距不受影响。
+        ui.painter().add(egui::epaint::TextShape::new(
+            rect.min,
+            galley.clone(),
+            base_color,
+        ));
+    }
 
     if response.double_clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            return word_at(&galley, pos - rect.min);
+            return (word_at(&galley, pos - rect.min), response);
         }
     }
-    None
+    (None, response)
 }
 
 /// 取出 galley 中指定位置所在的词，按分隔符向两侧扩展。
@@ -3037,6 +3464,23 @@ mod line_head_tests {
                     "{name}主题下 {lv:?} 级别的文字对比度只有 {r:.2}:1"
                 );
             }
+
+            // 选中行的整行底色：正文压在上面，两档都得过 AA。
+            // 选中行同时换成 strong_text_color()，断言的也是那一档——
+            // 深色主题的普通正文在蓝底上只有 3.0:1，换多深的底都不划算。
+            let on_sel = contrast(visuals.strong_text_color(), select_row_bg(dark));
+            assert!(
+                on_sel >= 4.5,
+                "{name}主题下选中行的正文对比度只有 {on_sel:.2}:1"
+            );
+
+            // 与"当前命中"的底色要分得开：两者都是蓝，糊成一片就分不清
+            // 哪一片是自己选中的
+            let sep = contrast(select_row_bg(dark), match_row_bg(dark));
+            assert!(
+                sep >= 1.3,
+                "{name}主题下选中色与命中色太接近（{sep:.2}:1），看不出哪片是选中的"
+            );
         }
     }
 
@@ -3086,6 +3530,189 @@ mod theme_tests {
 
         let back = next_theme(next_theme(next_theme(None)));
         assert_eq!(back, None, "三次点击应回到起点");
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::test_support::{big_app, frame, press, settle_app};
+    use super::*;
+
+    /// 向上拖时 anchor 在下方：区间必须自己排好序，否则包含判断会整个空掉
+    #[test]
+    fn range_is_order_independent() {
+        let s = RowSel {
+            anchor: 7,
+            focus: 3,
+        };
+        assert_eq!(s.range(), (3, 7));
+        assert_eq!(s.len(), 5);
+        assert!(s.contains(5));
+        assert!(!s.contains(2), "区间外的不算");
+        assert!(!s.contains(8));
+    }
+
+    /// Shift 扩展沿用原锚点，不按 Shift 则重新锚定。
+    ///
+    /// 中间特意改了一次滚动偏移：选择存在 `self` 里，与视口滚到哪里无关——
+    /// 这正是原来"翻页就丢掉前面的选择"修不掉的那个病根。
+    #[test]
+    fn shift_extends_while_plain_press_reanchors() {
+        let ctx = egui::Context::default();
+        let mut app = LogViewApp::new();
+
+        app.begin_row_sel(&ctx, 10, false);
+        assert_eq!(
+            app.row_sel,
+            Some(RowSel {
+                anchor: 10,
+                focus: 10
+            })
+        );
+        assert!(app.row_sel_drag, "按下就该进入拖动状态");
+
+        app.begin_row_sel(&ctx, 14, true);
+        assert_eq!(
+            app.row_sel,
+            Some(RowSel {
+                anchor: 10,
+                focus: 14
+            })
+        );
+        assert_eq!(app.row_sel.unwrap().len(), 5);
+
+        app.scroll_offset = 5000.0;
+        assert_eq!(
+            app.row_sel,
+            Some(RowSel {
+                anchor: 10,
+                focus: 14
+            }),
+            "翻页/滚动不该丢选择"
+        );
+
+        app.begin_row_sel(&ctx, 2, false);
+        assert_eq!(
+            app.row_sel,
+            Some(RowSel {
+                anchor: 2,
+                focus: 2
+            })
+        );
+    }
+
+    #[test]
+    fn clearing_removes_both_state_and_drag() {
+        let ctx = egui::Context::default();
+        let mut app = LogViewApp::new();
+        app.begin_row_sel(&ctx, 3, false);
+        app.clear_row_sel();
+        assert!(app.row_sel.is_none());
+        assert!(!app.row_sel_drag);
+    }
+
+    /// 复制走文件原文：整行选中，行与行之间用 `\n` 连接、末尾不带空行
+    #[test]
+    fn selection_text_reads_whole_lines_from_the_file() {
+        let mut app = big_app("selcopy", 300);
+        app.row_sel = Some(RowSel {
+            anchor: 0,
+            focus: 2,
+        });
+        let (text, rows, truncated) = app.selection_text().expect("应有文本");
+        assert_eq!(rows, 3);
+        assert!(!truncated);
+        assert_eq!(text, "进度 MARK\nplain line here\nplain line here");
+    }
+
+    /// 「只显示匹配行」下只收区间内的匹配行，不能把中间没显示的行也带上
+    #[test]
+    fn selection_text_skips_unmatched_rows_in_filtered_view() {
+        let mut app = big_app("selfilter", 300);
+        app.query = "MARK".to_string();
+        app.only_matched = true;
+        app.run_search(OnSearchDone::GotoFirstMatch);
+        settle_app(&mut app);
+        assert_eq!(app.store.as_ref().unwrap().matches().len(), 3);
+        app.row_sel = Some(RowSel {
+            anchor: 0,
+            focus: 150,
+        });
+        let (text, rows, _) = app.selection_text().unwrap();
+        assert_eq!(rows, 2, "0..=150 之间只有第 0、101 行命中");
+        assert!(text.lines().all(|l| l.contains("MARK")));
+    }
+
+    /// 文件被截短后，选择末端超出总行数不能越界
+    #[test]
+    fn selection_text_clamps_to_the_file_length() {
+        let mut app = big_app("selclamp", 10);
+        app.row_sel = Some(RowSel {
+            anchor: 5,
+            focus: 999,
+        });
+        let (_, rows, _) = app.selection_text().unwrap();
+        assert_eq!(rows, 5, "第 5..=9 行，共 5 行");
+    }
+
+    /// 拖得越远滚得越快，但要有上限——不然一帧滚过几十行，指针跟不住
+    #[test]
+    fn drag_scroll_speed_grows_with_distance() {
+        assert_eq!(drag_scroll_step(0.0), 1);
+        assert_eq!(drag_scroll_step(10.0), 1);
+        assert!(drag_scroll_step(60.0) > drag_scroll_step(20.0));
+        assert_eq!(drag_scroll_step(10_000.0), 6, "再远也封顶 6 行/帧");
+    }
+
+    /// 渲染一帧本身不该动选择——"翻页丢选择"那条的回归测试
+    #[test]
+    fn rendering_a_frame_keeps_the_selection() {
+        let ctx = egui::Context::default();
+        let mut app = big_app("selframe", 300);
+        app.row_sel = Some(RowSel {
+            anchor: 2,
+            focus: 8,
+        });
+        frame(&ctx, &mut app);
+        frame(&ctx, &mut app);
+        assert_eq!(
+            app.row_sel,
+            Some(RowSel {
+                anchor: 2,
+                focus: 8
+            })
+        );
+    }
+
+    /// Esc 一次退一层：先收选择；但搜索框有焦点时它就是"退出输入"，不能被选择抢走
+    #[test]
+    fn esc_clears_the_selection_only_when_the_search_box_is_not_focused() {
+        let ctx = egui::Context::default();
+        let mut app = LogViewApp::new();
+        app.begin_row_sel(&ctx, 3, false);
+
+        app.search_has_focus = true;
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.row_sel.is_some(), "搜索框里的 Esc 应只退出输入");
+
+        app.search_has_focus = false;
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(app.row_sel.is_none(), "日志区里的 Esc 应先收掉选行");
+    }
+
+    /// Esc 也要能退出"划字"模式：它的高亮归 egui 管，光清 `row_sel` 是清不掉的，
+    /// 模式还留着的话光标一直是 I 形、下次按下又变成划字。
+    #[test]
+    fn esc_leaves_the_char_select_mode() {
+        let ctx = egui::Context::default();
+        let mut app = LogViewApp::new();
+        app.char_select = true;
+        app.query = "needle".to_owned();
+
+        press(&ctx, &mut app, egui::Key::Escape, egui::Modifiers::NONE);
+
+        assert!(!app.char_select, "Esc 应先退出划字模式");
+        assert_eq!(app.query, "needle", "退一层：这一下不该顺手把检索也清了");
     }
 }
 
