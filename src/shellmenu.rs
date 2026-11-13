@@ -22,23 +22,36 @@
 //! 该背的发布流程了。界面上如实写明这一点，别让用户以为没装成功。
 
 /// 右键菜单项。挂在 `*` 上，所有文件都有。
+///
+/// 这一组常量只有 Windows 分支用得上，非 Windows 编译时整个不生成，
+/// 否则 `cargo clippy -D warnings` 会在 macOS / Linux 上把它们报成 dead_code。
+#[cfg(windows)]
 const VERB_KEY: &str = r"Software\Classes\*\shell\Logview";
+#[cfg(windows)]
 const COMMAND_KEY: &str = r"Software\Classes\*\shell\Logview\command";
 /// 「打开方式」列表里的程序条目。键名用 exe 文件名是 Windows 的约定。
+#[cfg(windows)]
 const APP_KEY: &str = r"Software\Classes\Applications\logview.exe";
+#[cfg(windows)]
 const APP_COMMAND_KEY: &str = r"Software\Classes\Applications\logview.exe\shell\open\command";
 
 /// 菜单文案与「打开方式」里显示的程序名
+#[cfg(windows)]
 const MENU_LABEL: &str = "用 logview 打开";
+#[cfg(windows)]
 const APP_LABEL: &str = "logview 日志查看器";
 
 /// 旧版按扩展名注册的那几项（v0.1.17 之前手工配置留下的）。
 ///
 /// 留着会和新的 `*` 项在 `.log` 上叠成两条一模一样的菜单项，
 /// 所以在安装与卸载时都顺手清掉。
+#[cfg(windows)]
 const LEGACY_VERB_KEY: &str = r"Software\Classes\SystemFileAssociations\.log\shell\OpenWithLogview";
+#[cfg(windows)]
 const LEGACY_PROGID_KEY: &str = r"Software\Classes\Logview.Log";
+#[cfg(windows)]
 const LEGACY_OPENWITH_KEY: &str = r"Software\Classes\.log\OpenWithProgids";
+#[cfg(windows)]
 const LEGACY_OPENWITH_VALUE: &str = "Logview.Log";
 
 /// 当前平台能不能做这件事。
@@ -81,6 +94,10 @@ pub fn current_exe() -> String {
 ///
 /// `%1` 是被右键的那个文件，资源管理器会把它换成完整路径；
 /// 加引号是因为路径里带空格太常见。
+///
+/// 只有 Windows 的 install 会调它，但单元测试在三个平台都跑，
+/// 所以这里不整段 cfg 掉，只关掉非 Windows 的 dead_code 检查。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn open_command(exe: &str) -> String {
     format!("\"{exe}\" \"%1\"")
 }
@@ -89,6 +106,7 @@ fn open_command(exe: &str) -> String {
 ///
 /// 存进去的是 `"C:\...\logview.exe" "%1"`，所以第一对引号之间就是程序路径。
 /// 不用 `split` 之类：路径里带空格是常态，靠分隔符切不靠谱。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn exe_from_command(cmd: &str) -> Option<String> {
     let start = cmd.find('"')? + 1;
     let rest = &cmd[start..];
@@ -162,13 +180,11 @@ pub fn uninstall() -> Result<(), String> {
 }
 
 /// 清掉旧版按扩展名注册的项，避免 `.log` 上出现两条同名菜单项。
+#[cfg(windows)]
 fn remove_legacy() {
-    #[cfg(windows)]
-    {
-        let _ = win::delete_tree(LEGACY_VERB_KEY);
-        let _ = win::delete_tree(LEGACY_PROGID_KEY);
-        let _ = win::delete_value(LEGACY_OPENWITH_KEY, LEGACY_OPENWITH_VALUE);
-    }
+    let _ = win::delete_tree(LEGACY_VERB_KEY);
+    let _ = win::delete_tree(LEGACY_PROGID_KEY);
+    let _ = win::delete_value(LEGACY_OPENWITH_KEY, LEGACY_OPENWITH_VALUE);
 }
 
 /// advapi32 的最小封装：只够本项目用，别当通用注册表库看。
