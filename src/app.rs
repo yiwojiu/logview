@@ -1,5 +1,6 @@
 use crate::bookmarks::{self, Bookmark};
 use crate::logstore::{encoding_name, LogStore, SearchRequest};
+use crate::shellmenu;
 use eframe::egui;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextStyle};
 use std::collections::HashSet;
@@ -136,6 +137,14 @@ pub struct LogViewApp {
     visible_rows: usize,
     /// 状态栏上的一次性提示（标记了第几行之类），几秒后自己消失
     flash: Option<(String, Instant)>,
+
+    /// 设置面板是否展开
+    show_settings: bool,
+    /// 资源管理器右键菜单的集成状态。
+    ///
+    /// `None` 表示还没查过：查询要起一个 `reg.exe`，不能放进每帧的 UI 里，
+    /// 只在打开面板、以及装/卸完成之后各查一次。
+    shell_menu: Option<Result<shellmenu::Status, String>>,
 
     last_refresh: Instant,
     buf: String,
@@ -277,6 +286,8 @@ impl Default for LogViewApp {
             focused_mark: None,
             visible_rows: 1,
             flash: None,
+            show_settings: false,
+            shell_menu: None,
             last_refresh: Instant::now(),
             buf: String::with_capacity(1024),
         }
@@ -1334,6 +1345,9 @@ impl eframe::App for LogViewApp {
         }
         egui::CentralPanel::default().show(ctx, |ui| self.log_area(ui));
 
+        // 浮层放在中央面板之后：它是设置窗口，不该被日志区盖住
+        self.settings_window(ctx);
+
         // 快捷键放在各面板之后：此时 search_has_focus 已是本帧的最新状态
         self.handle_shortcuts(ctx);
 
@@ -1390,6 +1404,7 @@ impl LogViewApp {
             // 视图开关靠右。right_to_left 里先加的排在更右边，所以这里是视觉上的倒序。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.theme_button(ui);
+                self.settings_button(ui);
                 ui.checkbox(&mut self.wrap, "自动换行")
                     .on_hover_text("长行折行显示；开启后跳转定位不再精确");
                 ui.checkbox(&mut self.follow, "跟随尾部")
@@ -1493,6 +1508,152 @@ impl LogViewApp {
         };
         if ui.button(icon.to_string()).on_hover_text(tip).clicked() {
             self.dark = next_theme(self.dark);
+        }
+    }
+
+    /// 设置入口。摆在主题按钮左边：两者都改"程序怎么表现"，但设置是低频动作，
+    /// 所以只给一个图标，把文字宽度让给旁边的视图开关。
+    fn settings_button(&mut self, ui: &mut egui::Ui) {
+        if ui.button("⚙").on_hover_text("设置").clicked() {
+            self.show_settings = !self.show_settings;
+            if self.show_settings {
+                self.refresh_shell_menu();
+            }
+        }
+    }
+
+    fn refresh_shell_menu(&mut self) {
+        self.shell_menu = Some(shellmenu::status());
+    }
+
+    fn set_shell_menu(&mut self, enable: bool) {
+        let done = if enable {
+            shellmenu::install()
+        } else {
+            shellmenu::uninstall()
+        };
+        match done {
+            Ok(()) => {
+                self.flash(if enable {
+                    "已加入右键菜单"
+                } else {
+                    "已从右键菜单移除"
+                });
+                self.refresh_shell_menu();
+            }
+            // 失败时只更新状态行，不弹窗：这里出错的常见原因是权限或安全软件拦截，
+            // 把 reg.exe 自己的话原样摆出来比"操作失败"有用得多
+            Err(e) => self.shell_menu = Some(Err(e)),
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("设置")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(460.0)
+            .show(ctx, |ui| self.settings_body(ui));
+        self.show_settings = open;
+    }
+
+    fn settings_body(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(440.0);
+
+        ui.label(RichText::new("资源管理器集成").strong());
+        ui.add_space(4.0);
+
+        // 勾选状态来自注册表而不是本地变量：菜单项是全局的，
+        // 换了程序路径、或者上一版自己注册过，都得以实际注册表为准
+        let mut want = matches!(&self.shell_menu, Some(Ok(st)) if st.installed);
+        let mut changed = false;
+        ui.add_enabled_ui(shellmenu::SUPPORTED, |ui| {
+            changed = ui
+                .checkbox(&mut want, "把「用 logview 打开」加进所有文件的右键菜单")
+                .changed();
+        });
+
+        let weak = ui.visuals().weak_text_color();
+        ui.add_space(4.0);
+        ui.indent("shell_menu_hint", |ui| {
+            if shellmenu::SUPPORTED {
+                ui.label(
+                    RichText::new("只写当前用户（HKCU），不需要管理员权限；随时可以在这里取消。")
+                        .color(weak)
+                        .small(),
+                );
+                ui.label(
+                    RichText::new(
+                        "Windows 11 的一级右键菜单不收这类扩展，要到「显示更多选项」里找。",
+                    )
+                    .color(weak)
+                    .small(),
+                );
+            } else {
+                ui.label(
+                    RichText::new(
+                        "当前平台暂未实现：macOS 要打包服务扩展，Linux 该走 .desktop 关联。",
+                    )
+                    .color(weak)
+                    .small(),
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+        self.shell_menu_status_line(ui);
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("版本").color(weak));
+            ui.label(env!("CARGO_PKG_VERSION"));
+        });
+
+        if changed {
+            self.set_shell_menu(want);
+        }
+    }
+
+    /// 状态行。「已启用」不足以说明问题：注册表里的路径可能指向另一个 logview，
+    /// 那时菜单项照样在，点下去打开的却不是你眼前这个程序。
+    fn shell_menu_status_line(&self, ui: &mut egui::Ui) {
+        let dark = ui.visuals().dark_mode;
+        let weak = muted_text(dark);
+        match &self.shell_menu {
+            None => {
+                ui.label(RichText::new("正在读取注册表…").color(weak));
+            }
+            Some(Err(e)) => {
+                ui.label(
+                    RichText::new(format!("读取失败：{e}")).color(Level::Error.style(dark).fg),
+                );
+            }
+            Some(Ok(st)) if !st.installed => {
+                ui.label(RichText::new("当前未启用").color(weak));
+            }
+            Some(Ok(st)) if st.points_elsewhere() => {
+                ui.label(
+                    RichText::new(format!(
+                        "已启用，但指向的是 {}",
+                        st.registered_exe.as_deref().unwrap_or("另一个路径")
+                    ))
+                    .color(Level::Warn.style(dark).fg),
+                );
+                ui.label(
+                    RichText::new("取消再勾一次，就会换成当前这个程序。")
+                        .color(weak)
+                        .small(),
+                );
+            }
+            Some(Ok(_)) => {
+                ui.label(RichText::new("当前已启用").color(weak));
+            }
         }
     }
 
