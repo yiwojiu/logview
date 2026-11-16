@@ -581,16 +581,41 @@ fn decode_into(raw: &[u8], encoding: &'static Encoding, out: &mut String) {
     }
 }
 
-/// 编码嗅探：优先 UTF-8，失败回退 GB18030（覆盖 Windows 中文环境的 GBK 日志）
+/// 编码嗅探只读开头这么多字节
+const SNIFF_LEN: usize = 64 * 1024;
+
+/// 编码嗅探：优先 UTF-8，失败回退 GB18030（覆盖 Windows 中文环境的 GBK 日志）。
+///
+/// 窗口右端必须落在**完整字符**上。65536 不是 3 的倍数，连续的中文日志必然在边缘
+/// 把某个汉字切成两半，而 `from_utf8` 会把这半个字符报成"非法字节"——于是整篇
+/// UTF-8 日志降级成 GB18030，每一行中文都变成乱码。实测 mosaic-export.log：
+/// 65534 处正好是「时」的前两个字节 `E6 97`，文件明明是 UTF-8，状态栏却显示 GB18030。
 fn sniff_encoding(data: &[u8], len: usize) -> &'static Encoding {
-    let head = &data[..len.min(64 * 1024)];
-    if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+    let window = &data[..len.min(SNIFF_LEN)];
+    if window.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return UTF_8;
     }
-    if std::str::from_utf8(head).is_ok() {
+    if std::str::from_utf8(whole_characters(window)).is_ok() {
         return UTF_8;
     }
     GB18030
+}
+
+/// 砍掉窗口末尾可能残缺的那一截，只留完整字符。
+///
+/// 优先截到最后一个换行：`\n` 不会出现在 UTF-8 或 GB18030 的多字节序列内部，
+/// 按它切绝不切坏字符。整段没有换行（几万字节的单行日志）时，用 UTF-8 自己报的
+/// 错误位置退回去——`error_len() == None` 就是"输入在末尾断掉"，不是"字节非法"。
+fn whole_characters(window: &[u8]) -> &[u8] {
+    if let Some(i) = window.iter().rposition(|&b| b == b'\n') {
+        return &window[..i];
+    }
+    match std::str::from_utf8(window) {
+        Ok(_) => window,
+        // valid_up_to() 为 0 说明开头就不对，那是真的不是 UTF-8，别退成空切片
+        Err(e) if e.error_len().is_none() && e.valid_up_to() > 0 => &window[..e.valid_up_to()],
+        Err(_) => window,
+    }
 }
 
 pub fn is_utf8(e: &'static Encoding) -> bool {
@@ -609,6 +634,53 @@ pub fn encoding_name(e: &'static Encoding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 嗅探窗口的右端会切在一个汉字中间——65536 不是 3 的倍数，连续中文时必然发生。
+    ///
+    /// 那不是"这文件不是 UTF-8"，是"我们没看全"。按字节判会把这个 UTF-8 文件
+    /// 整篇当 GB18030 解，于是每一行中文都变成乱码（实测：mosaic-export.log 的
+    /// 65534 处正好是「时」的前两个字节 E6 97）。
+    #[test]
+    fn utf8_cjk_spanning_the_sniff_window_edge_is_still_utf8() {
+        // 从 0 开始排满三字节汉字：第 21845 个『中』起始于 65535，
+        // 于是 [..65536] 只拿到它的前两个字节
+        let text = "中".repeat(30_000);
+        let bytes = text.as_bytes();
+        assert!(
+            std::str::from_utf8(&bytes[..65_536]).is_err(),
+            "前提：窗口边界确实切断了一个汉字"
+        );
+        assert!(
+            is_utf8(sniff_encoding(bytes, bytes.len())),
+            "被窗口切断的汉字不该让整个文件降级为 GB18030"
+        );
+    }
+
+    /// 同样的切断，但每行是正常的日志行（窗口边界落在一行中间）。
+    #[test]
+    fn utf8_line_cut_by_the_window_edge_is_still_utf8() {
+        let mut text = String::new();
+        while text.len() < 80_000 {
+            text.push_str("中文日志数据行\n");
+        }
+        let bytes = text.as_bytes();
+        assert!(
+            std::str::from_utf8(&bytes[..65_536]).is_err(),
+            "前提：窗口边界确实切断了字符"
+        );
+        assert!(is_utf8(sniff_encoding(bytes, bytes.len())));
+    }
+
+    /// 真正的 GBK 日志仍然要判成 GB18030，别把上面那条修成"一律 UTF-8"。
+    #[test]
+    fn gbk_log_is_still_detected_as_gb18030() {
+        let mut text = String::new();
+        while text.len() < 80_000 {
+            text.push_str("2026-11-13 17:56:08.425 INFO  中文数据，处理完成\n");
+        }
+        let bytes = encoding_rs::GB18030.encode(&text).0;
+        assert!(!is_utf8(sniff_encoding(&bytes, bytes.len())));
+    }
 
     /// 上限的算术：位置留到上限为止，总数继续累加；正好到上限不算截断。
     #[test]
